@@ -1,26 +1,74 @@
 #!/usr/bin/env bash
 # Smart terminal launcher for ASCII-DE:
-# Prefers kitty (with ascii-de-kitty.conf when present), automatically falling back
-# to foot, konsole, alacritty, or xterm if kitty fails EGL/OpenGL initialization
-# (e.g. inside VMs with software llvmpipe rendering).
+# Tries kitty first (for hardware GL desktops), then safely cascades through
+# alacritty, konsole, xfce4-terminal, xterm, and foot whenever an emulator
+# exits immediately (e.g. kitty EGL failure in VMs or foot wl_data_device_manager mismatch).
 
 set -u
 
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ascii-de"
+LOG_FILE="$CACHE_DIR/terminal.log"
 KITTY_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/ascii-de/xdg-config/ascii-de-kitty.conf"
 if [ ! -f "$KITTY_CONF" ]; then
     KITTY_CONF="$HOME/.config/ascii-de/xdg-config/ascii-de-kitty.conf"
 fi
 
-run_fallback_terminal() {
-    local term
-    for term in alacritty foot konsole xterm; do
-        if command -v "$term" >/dev/null 2>&1; then
-            exec "$term" "$@"
+log_term() {
+    mkdir -p "$CACHE_DIR" >/dev/null 2>&1 || true
+    printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo now)" "$1" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+ensure_x11_display() {
+    if [ -n "${DISPLAY:-}" ]; then
+        return 0
+    fi
+    local sock num
+    for num in $(seq 14 20); do
+        if [ -S "/tmp/.X11-unix/X${num}" ]; then
+            export DISPLAY=":${num}"
+            return 0
         fi
     done
-    echo "ascii-de-terminal: no supported terminal emulator found (tried kitty, alacritty, foot, konsole, xterm)" >&2
-    exit 1
+    for sock in /tmp/.X11-unix/X*; do
+        [ -S "$sock" ] || continue
+        export DISPLAY=":${sock##*/X}"
+        return 0
+    done
 }
+
+try_terminal() {
+    local term="$1"
+    shift
+    if ! command -v "$term" >/dev/null 2>&1; then
+        return 1
+    fi
+    local start_ts end_ts rc err_tmp
+    err_tmp="$(mktemp 2>/dev/null || echo "")"
+    start_ts="$(date +%s)"
+    set +e
+    if [ -n "$err_tmp" ]; then
+        "$term" "$@" 2>"$err_tmp"
+        rc=$?
+    else
+        "$term" "$@"
+        rc=$?
+    fi
+    set -e
+    end_ts="$(date +%s)"
+    if [ "$rc" -eq 0 ] || [ $((end_ts - start_ts)) -gt 2 ]; then
+        rm -f "$err_tmp" 2>/dev/null || true
+        exit "$rc"
+    fi
+    if [ -n "$err_tmp" ] && [ -s "$err_tmp" ]; then
+        log_term "$term exited ($rc) immediately: $(head -n 3 "$err_tmp" | tr '\n' ' ')"
+    else
+        log_term "$term exited ($rc) immediately"
+    fi
+    rm -f "$err_tmp" 2>/dev/null || true
+    return 1
+}
+
+ensure_x11_display
 
 if command -v kitty >/dev/null 2>&1; then
     KITTY_ARGS=()
@@ -38,17 +86,13 @@ if command -v kitty >/dev/null 2>&1; then
             KITTY_ARGS=(-o "include=$KITTY_CONF")
         fi
     fi
-
-    START_TS="$(date +%s)"
-    set +e
-    kitty "${KITTY_ARGS[@]}" "$@"
-    RC=$?
-    set -e
-    END_TS="$(date +%s)"
-
-    if [ "$RC" -eq 0 ] || [ $((END_TS - START_TS)) -gt 3 ]; then
-        exit "$RC"
-    fi
+    try_terminal kitty "${KITTY_ARGS[@]}" "$@" || true
 fi
 
-run_fallback_terminal "$@"
+for term in alacritty konsole xfce4-terminal xterm foot; do
+    try_terminal "$term" "$@" || true
+done
+
+echo "ascii-de-terminal: no working terminal emulator succeeded (tried kitty, alacritty, konsole, xfce4-terminal, xterm, foot)" >&2
+log_term "all terminal candidates failed"
+exit 1

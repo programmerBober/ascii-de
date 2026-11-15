@@ -2246,7 +2246,7 @@ Rectangle {
                                             root.checkingUpdates = true;
                                             root.statusError = false;
                                             root.statusMessage = "Checking for ASCII-DE updates...";
-                                            root.runBackend(["update-check"], "settings_update_check");
+                                            root.runBackend(["update-check", "--force"], "settings_update_check");
                                         }
                                     }
                                 }

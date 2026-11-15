@@ -27,7 +27,7 @@ All runtime dependencies live in the official Arch `extra` repository (no AUR de
 sudo pacman -S --needed \
   qt6-base qt6-declarative qt6-imageformats qt6-wayland wayland kwin libkscreen \
   xwayland-satellite xorg-xwayland wl-clipboard pam dbus chafa \
-  libpulse wireplumber kitty foot ttf-jetbrains-mono breeze-icons \
+  libpulse wireplumber kitty xterm ttf-jetbrains-mono breeze-icons \
   playerctl brightnessctl bluez-utils rofi bluetui \
   python python-pyqt6 python-evdev python-xlib jq curl
 ```

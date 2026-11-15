@@ -53,7 +53,7 @@ fn main() -> ExitCode {
         "bg-ascii" => bg_ascii::handle_bg_ascii_cmd(&args[1..]),
         "version" | "--version" | "-V" => Ok(maintain::handle_version_cmd(&args[1..])),
         "migrate" => maintain::handle_migrate_cmd(),
-        "update-check" => Ok(maintain::handle_update_check_cmd()),
+        "update-check" => Ok(maintain::handle_update_check_cmd(&args[1..])),
         "bug-report" => bugreport::handle_bug_report_cmd(&args[1..]),
         "-h" | "--help" | "help" => {
             print_usage();

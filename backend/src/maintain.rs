@@ -158,9 +158,14 @@ fn find_update_bin() -> Option<PathBuf> {
     None
 }
 
-pub fn handle_update_check_cmd() -> String {
+pub fn handle_update_check_cmd(args: &[String]) -> String {
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
     if let Some(bin) = find_update_bin() {
-        if let Ok(out) = Command::new(&bin).args(["--check", "--json"]).output() {
+        let mut cmd_args = vec!["--check", "--json"];
+        if force {
+            cmd_args.push("--force");
+        }
+        if let Ok(out) = Command::new(&bin).args(&cmd_args).output() {
             if out.status.success() {
                 let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 if !text.is_empty() && json::parse(&text).is_ok() {
@@ -170,13 +175,15 @@ pub fn handle_update_check_cmd() -> String {
         }
     }
 
-    let cache_path = hardware::xdg_cache_home()
-        .join("ascii-de")
-        .join("update-check.json");
-    if let Ok(raw) = fs::read_to_string(&cache_path) {
-        let trimmed = raw.trim().to_string();
-        if !trimmed.is_empty() && json::parse(&trimmed).is_ok() {
-            return trimmed;
+    if !force {
+        let cache_path = hardware::xdg_cache_home()
+            .join("ascii-de")
+            .join("update-check.json");
+        if let Ok(raw) = fs::read_to_string(&cache_path) {
+            let trimmed = raw.trim().to_string();
+            if !trimmed.is_empty() && json::parse(&trimmed).is_ok() {
+                return trimmed;
+            }
         }
     }
 

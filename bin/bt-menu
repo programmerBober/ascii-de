@@ -61,7 +61,7 @@ def open_terminal(cmd_args):
     sibling = Path(__file__).resolve().parent / "ascii-de-terminal"
     if sibling.is_file() and os.access(sibling, os.X_OK):
         candidates.append(str(sibling))
-    for name in ("ascii-de-terminal", "kitty", "alacritty", "foot", "konsole", "xterm"):
+    for name in ("ascii-de-terminal", "kitty", "alacritty", "konsole", "xterm", "foot"):
         found = shutil.which(name)
         if found and found not in candidates:
             candidates.append(found)

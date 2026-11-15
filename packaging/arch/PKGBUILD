@@ -1,6 +1,6 @@
 # Maintainer: programmerBober <258656110+programmerBober@users.noreply.github.com>
 pkgname=ascii-de
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Native compiled ASCII Desktop Environment (Qt6 Wayland Compositor + Rust backend)"
 arch=('x86_64')
@@ -23,7 +23,7 @@ depends=(
   libpulse
   wireplumber
   kitty
-  foot
+  xterm
   ttf-jetbrains-mono
   breeze-icons
   playerctl

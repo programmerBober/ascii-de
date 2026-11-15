@@ -305,7 +305,12 @@ void DesktopBridge::launchApp(const QString &cmd)
     const bool isKitty = (trimmed == QStringLiteral("kitty")
                           || trimmed.startsWith(QStringLiteral("kitty "))
                           || trimmed.contains(QStringLiteral("/kitty")));
-    if (isKitty) {
+    const bool isFoot = (trimmed == QStringLiteral("foot")
+                         || (trimmed.startsWith(QStringLiteral("foot "))
+                             && !trimmed.contains(QStringLiteral("--server")))
+                         || trimmed == QStringLiteral("footclient")
+                         || trimmed.startsWith(QStringLiteral("footclient ")));
+    if (isKitty || isFoot) {
         QString termWrapper = QCoreApplication::applicationDirPath() + QStringLiteral("/ascii-de-terminal");
         if (!QFileInfo::exists(termWrapper) || !QFileInfo(termWrapper).isExecutable()) {
             termWrapper = QStandardPaths::findExecutable(QStringLiteral("ascii-de-terminal"));
