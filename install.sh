@@ -7,6 +7,14 @@ if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 
+_CLEANUP_DIRS=()
+cleanup_tmp_dirs() {
+    if [[ "${#_CLEANUP_DIRS[@]}" -gt 0 ]]; then
+        rm -rf "${_CLEANUP_DIRS[@]}"
+    fi
+}
+trap cleanup_tmp_dirs EXIT
+
 MODE="release"
 YES_MODE=0
 BUILD_ONLY=0
@@ -105,7 +113,7 @@ install_local_makepkg() {
     local tar_name="ascii-de-${ver}.tar.gz"
     local stage_dir
     stage_dir="$(mktemp -d)"
-    trap 'rm -rf "$stage_dir"' RETURN
+    _CLEANUP_DIRS+=("$stage_dir")
 
     mkdir -p "$stage_dir/ascii-de-${ver}"
     tar -C "$SCRIPT_DIR" \
@@ -183,13 +191,13 @@ print("\t".join((pkg.get("name", ""), pkg.get("browser_download_url", ""), sums.
 
     local tmp_dir
     tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "$tmp_dir"' EXIT
+    _CLEANUP_DIRS+=("$tmp_dir")
 
     echo "Downloading ${pkg_name}..."
     curl -fsSL --max-time 120 -o "$tmp_dir/$pkg_name" "$pkg_url"
     curl -fsSL --max-time 15 -o "$tmp_dir/SHA256SUMS" "$sum_url"
 
-    (cd "$tmp_dir" && grep -E "(^|[[:space:]]|\*)${pkg_name}$" SHA256SUMS | sha256sum -c -)
+    (cd "$tmp_dir" && grep -E "(^|[[:space:]]|\*)${pkg_name}$" SHA256SUMS | head -n 1 | sha256sum -c -)
 
     local pac_flags=(-U --needed)
     [[ "$YES_MODE" -eq 1 ]] && pac_flags+=(--noconfirm)
@@ -202,7 +210,7 @@ print("\t".join((pkg.get("name", ""), pkg.get("browser_download_url", ""), sums.
         fi
     }
 
-    if [[ ! -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+    if [[ "$YES_MODE" -eq 0 && ! -t 0 ]] && { : < /dev/tty; } 2>/dev/null; then
         run_pacman "${pac_flags[@]}" "$tmp_dir/$pkg_name" < /dev/tty
     else
         run_pacman "${pac_flags[@]}" "$tmp_dir/$pkg_name"

@@ -8,6 +8,14 @@ CACHE_TTL=86400
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+_CLEANUP_DIRS=()
+cleanup_tmp_dirs() {
+    if [[ "${#_CLEANUP_DIRS[@]}" -gt 0 ]]; then
+        rm -rf "${_CLEANUP_DIRS[@]}"
+    fi
+}
+trap cleanup_tmp_dirs EXIT
+
 usage() {
     cat <<'EOF'
 Usage:
@@ -269,7 +277,7 @@ apply_local_pkg() {
             [[ "$prefix" == "$HOME/.local" ]] || prefix="$HOME/.local"
             local stage
             stage="$(mktemp -d)"
-            trap 'rm -rf "$stage"' RETURN
+            _CLEANUP_DIRS+=("$stage")
             tar --zstd -xf "$pkg_path" -C "$stage" 2>/dev/null || tar -xf "$pkg_path" -C "$stage"
             local root_dir="$stage"
             if [[ ! -d "$stage/bin" ]]; then
@@ -342,8 +350,8 @@ apply_binary_release() {
     fi
 
     local pkg_url pkg_name sum_url
-    pkg_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$")) | .browser_download_url' | head -n 1)"
-    pkg_name="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$")) | .name' | head -n 1)"
+    pkg_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select((.name | test("^ascii-de-debug-") | not) and (.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$"))) | .browser_download_url' | head -n 1)"
+    pkg_name="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select((.name | test("^ascii-de-debug-") | not) and (.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$"))) | .name' | head -n 1)"
     sum_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name == "SHA256SUMS") | .browser_download_url' | head -n 1)"
 
     if [[ -z "$pkg_url" || -z "$sum_url" ]]; then
@@ -353,7 +361,7 @@ apply_binary_release() {
 
     local tmp_dir
     tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "$tmp_dir"' EXIT
+    _CLEANUP_DIRS+=("$tmp_dir")
 
     echo "Downloading ${pkg_name} and SHA256SUMS..."
     curl -fsSL --max-time 120 -o "$tmp_dir/$pkg_name" "$pkg_url"
