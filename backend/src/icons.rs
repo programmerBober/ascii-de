@@ -364,7 +364,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).expect("mkdir");
 
-        let icons = default_icons_with_env(&[tmp.clone()], &[tmp.clone()]);
+        let icons = default_icons_with_env(std::slice::from_ref(&tmp), std::slice::from_ref(&tmp));
         let ids: Vec<&str> = icons.iter().map(|i| i.id.as_str()).collect();
         assert_eq!(ids, vec!["term", "settings", "mixer"]);
         assert_eq!(icons[0].cmd, "ascii-de-terminal");

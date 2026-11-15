@@ -20,9 +20,9 @@ jobs:
           pacman-key --populate archlinux
           pacman -Syu --noconfirm --needed \
             git cmake ninja rust gcc namcap tar zstd \
-            qt6-base qt6-declarative qt6-wayland wayland kwin libkscreen \
+            qt6-base qt6-declarative qt6-imageformats qt6-wayland wayland kwin libkscreen \
             xwayland-satellite xorg-xwayland wl-clipboard pam dbus chafa \
-            libpulse wireplumber kitty ttf-jetbrains-mono breeze-icons \
+            libpulse wireplumber kitty foot ttf-jetbrains-mono breeze-icons \
             playerctl brightnessctl bluez-utils rofi bluetui \
             python python-pyqt6 python-evdev python-xlib jq curl
 
