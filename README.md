@@ -1,4 +1,7 @@
-# ASCII-DE
+# ASCII-DE (Beta)
+
+> [!WARNING]
+> **Public Beta:** ASCII-DE is in active development and may contain rough edges or bugs. Please test updates in a VM or keep another Wayland session installed, and report issues via **Settings → 7. Updates & Bugs** or `ascii-de bug-report --upload`.
 
 A native compiled ASCII-styled Wayland Desktop Environment for Linux (Arch / EndeavourOS), combining a **Qt6 Wayland Compositor** (`ascii-de-compositor`), a **QML shell & window chrome** (`ui/`), and a **zero-dependency pure-std Rust backend** (`ascii-de-backend`).
 
@@ -113,6 +116,17 @@ ascii-de update --apply
 ## Updating Safely
 
 `ascii-de update` checks GitHub Releases (with a 24h cache in `~/.cache/ascii-de/update-check.json`), verifies `SHA256SUMS`, installs the new `.pkg.tar.zst` (or pulls & rebuilds in source mode), runs `ascii-de-backend migrate` (creating a timestamped backup under `~/.config/ascii-de/backups/` before adding any new default keys), and never overwrites `~/.config/ascii-de/{settings,theme,monitors,desktop-icons}.json` or interrupts an active Wayland session.
+
+---
+
+## Bug Reports
+
+Generate sanitized system, audio, Bluetooth, display, and session logs from **Settings → 7. Updates & Bugs** or via CLI:
+
+```bash
+ascii-de bug-report --note "short description"          # save & copy report
+ascii-de bug-report --upload --note "short description" # optional paste.rs link + GitHub Issue URL
+```
 
 ---
 
