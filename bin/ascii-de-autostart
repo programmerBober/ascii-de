@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ASCII-DE Autostart Runner
+# Runs background startup hooks and user session autostarts
+# ==============================================================================
+
+AUTOSTART_HOOK="${XDG_CONFIG_HOME:-$HOME/.config}/ascii-de/autostart.sh"
+if [ -x "$AUTOSTART_HOOK" ]; then
+    "$AUTOSTART_HOOK" &
+fi
+
+exit 0

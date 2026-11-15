@@ -1,0 +1,102 @@
+# Maintainer: programmerBober <258656110+programmerBober@users.noreply.github.com>
+pkgname=ascii-de
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native compiled ASCII Desktop Environment (Qt6 Wayland Compositor + Rust backend)"
+arch=('x86_64')
+url="https://github.com/programmerBober/ascii-de"
+license=('MIT')
+depends=(
+  qt6-base
+  qt6-declarative
+  qt6-imageformats
+  qt6-wayland
+  wayland
+  kwin
+  libkscreen
+  xwayland-satellite
+  xorg-xwayland
+  wl-clipboard
+  pam
+  dbus
+  chafa
+  libpulse
+  wireplumber
+  kitty
+  foot
+  ttf-jetbrains-mono
+  breeze-icons
+  playerctl
+  brightnessctl
+  bluez-utils
+  rofi
+  bluetui
+  python
+  python-pyqt6
+  python-evdev
+  python-xlib
+  jq
+  curl
+)
+makedepends=(cmake ninja rust gcc)
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/programmerBober/${pkgname}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  export PATH="$HOME/.cargo/bin:$PATH"
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  cmake -B compositor/build -S compositor -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr
+  cmake --build compositor/build -j"$(nproc)"
+
+  cargo build --manifest-path backend/Cargo.toml --release --locked
+}
+
+check() {
+  export PATH="$HOME/.cargo/bin:$PATH"
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  cargo test --manifest-path backend/Cargo.toml --locked
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+
+  DESTDIR="$pkgdir" cmake --install compositor/build
+
+  install -Dm755 backend/target/release/ascii-de-backend "$pkgdir/usr/bin/ascii-de-backend"
+  install -Dm755 bin/ascii-de "$pkgdir/usr/bin/ascii-de"
+  install -Dm755 bin/ascii-de-settings "$pkgdir/usr/bin/ascii-de-settings"
+  install -Dm755 bin/ascii-de-terminal "$pkgdir/usr/bin/ascii-de-terminal"
+  install -Dm755 bin/ascii-de-x11-scroll-bridge "$pkgdir/usr/bin/ascii-de-x11-scroll-bridge"
+  install -Dm755 bin/ascii-de-update "$pkgdir/usr/bin/ascii-de-update"
+  install -Dm755 bin/bt-menu "$pkgdir/usr/bin/bt-menu"
+  if [[ -f bin/ascii-de-autostart ]]; then
+    install -Dm755 bin/ascii-de-autostart "$pkgdir/usr/bin/ascii-de-autostart"
+  fi
+
+  install -Dm755 bin/shims/xclip "$pkgdir/usr/lib/ascii-de/bin/xclip"
+  install -Dm755 bin/shims/xsel "$pkgdir/usr/lib/ascii-de/bin/xsel"
+
+  install -dm755 "$pkgdir/usr/share/ascii-de/ui"
+  cp -a ui/. "$pkgdir/usr/share/ascii-de/ui/"
+  find "$pkgdir/usr/share/ascii-de/ui" -type f -exec chmod 644 {} +
+
+  install -Dm644 /dev/stdin "$pkgdir/usr/share/ascii-de/install-meta.json" <<EOF
+{
+  "version": "${pkgver}",
+  "installMethod": "pacman",
+  "repo": "programmerBober/ascii-de",
+  "prefix": "/usr"
+}
+EOF
+
+  install -Dm644 systemd/user/ascii-de-x11-scroll-bridge.service \
+    "$pkgdir/usr/lib/systemd/user/ascii-de-x11-scroll-bridge.service"
+  install -Dm644 sessions/ascii-de.desktop \
+    "$pkgdir/usr/share/wayland-sessions/ascii-de.desktop"
+
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/${pkgname}/README.md"
+}

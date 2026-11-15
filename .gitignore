@@ -1,0 +1,21 @@
+# Build artifacts
+compositor/build/
+backend/target/
+build/
+dist/
+
+# Arch / makepkg artifacts
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+*.tar.zst
+*.tar.gz
+SHA256SUMS
+packaging/arch/src/
+packaging/arch/pkg/
+
+# Caches, logs, python bytecode
+.cache/
+__pycache__/
+*.pyc
+*.log
+.DS_Store

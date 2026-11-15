@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""
+ascii-de-x11-scroll-bridge: Ultra-low latency evdev -> X11 XTest wheel bridge for ASCII-DE.
+Solves the upstream Wayland/Xwayland missing-frame bug for Discord, Steam, and X11 apps.
+"""
+
+import os
+import select
+import time
+import evdev
+from evdev import ecodes
+from Xlib import display, X
+from Xlib.ext import xtest
+
+
+HEARTBEAT_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+    "ascii-de-scroll-bridge.alive",
+)
+
+
+def touch_heartbeat():
+    try:
+        with open(HEARTBEAT_PATH, "a", encoding="utf-8"):
+            pass
+        os.utime(HEARTBEAT_PATH, None)
+    except OSError:
+        pass
+
+
+def scan_wheel_device_specs():
+    """Return dict {path: (InputDevice, has_rel_wheel, has_hires_wheel)}."""
+    specs = {}
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+            caps = dev.capabilities()
+            rel_caps = caps.get(ecodes.EV_REL, [])
+            has_wheel = ecodes.REL_WHEEL in rel_caps
+            has_hwheel = ecodes.REL_HWHEEL in rel_caps
+            has_hires = hasattr(ecodes, "REL_WHEEL_HI_RES") and ecodes.REL_WHEEL_HI_RES in rel_caps
+            if has_wheel or has_hwheel or has_hires:
+                specs[path] = (dev, has_wheel, has_hires)
+            else:
+                dev.close()
+        except Exception:
+            pass
+    return specs
+
+
+def sync_wheel_devices(current_devices):
+    """
+    Reconcile open InputDevice instances by (dev.path, dev.fd).
+    Closes removed/stale InputDevice objects cleanly.
+    """
+    desired_paths = set()
+    fresh_candidates = {}
+    for path in evdev.list_devices():
+        if path in current_devices:
+            desired_paths.add(path)
+            continue
+        try:
+            dev = evdev.InputDevice(path)
+            caps = dev.capabilities()
+            rel_caps = caps.get(ecodes.EV_REL, [])
+            has_wheel = ecodes.REL_WHEEL in rel_caps
+            has_hwheel = ecodes.REL_HWHEEL in rel_caps
+            has_hires = hasattr(ecodes, "REL_WHEEL_HI_RES") and ecodes.REL_WHEEL_HI_RES in rel_caps
+            if has_wheel or has_hwheel or has_hires:
+                desired_paths.add(path)
+                fresh_candidates[path] = (dev, has_wheel, has_hires)
+            else:
+                dev.close()
+        except Exception:
+            pass
+
+    for path in list(current_devices.keys()):
+        if path not in desired_paths:
+            old_dev, _, _ = current_devices.pop(path)
+            try:
+                old_dev.close()
+            except Exception:
+                pass
+
+    current_devices.update(fresh_candidates)
+    return current_devices
+
+
+def detect_x11_displays():
+    env_disp = os.environ.get("DISPLAY", "").strip()
+    candidates = []
+    if env_disp:
+        candidates.append(env_disp)
+    try:
+        nums = []
+        for entry in os.listdir("/tmp/.X11-unix"):
+            if entry.startswith("X") and entry[1:].isdigit():
+                nums.append(int(entry[1:]))
+        nums.sort(key=lambda n: (0 if 14 <= n <= 20 else 1, n))
+        for n in nums:
+            d = f":{n}"
+            if d not in candidates:
+                candidates.append(d)
+    except OSError:
+        pass
+    if ":14" not in candidates:
+        candidates.append(":14")
+    return candidates
+
+
+def main():
+    d = None
+    root = None
+
+    def close_x11():
+        nonlocal d, root
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+        d = None
+        root = None
+
+    def connect_x11():
+        nonlocal d, root
+        close_x11()
+        for disp in detect_x11_displays():
+            try:
+                d = display.Display(disp)
+                root = d.screen().root
+                return True
+            except Exception:
+                d = None
+                root = None
+        return False
+
+    def inject_clicks(btn, clicks):
+        nonlocal d, root
+        for attempt in range(2):
+            if d is None or root is None:
+                if not connect_x11():
+                    return False
+            try:
+                qp = root.query_pointer()
+                child_id = qp.child.id if hasattr(qp.child, "id") else 0
+                if child_id == 0:
+                    return True
+                for _ in range(clicks):
+                    xtest.fake_input(d, X.ButtonPress, btn)
+                    xtest.fake_input(d, X.ButtonRelease, btn)
+                d.sync()
+                return True
+            except Exception:
+                close_x11()
+                if attempt == 0 and connect_x11():
+                    continue
+                return False
+        return False
+
+    touch_heartbeat()
+    connect_x11()
+
+    dev_entries = scan_wheel_device_specs()
+    hires_accum = {}
+    last_rescan = time.time()
+    last_heartbeat = time.time()
+    rel_wheel_hires = getattr(ecodes, "REL_WHEEL_HI_RES", None)
+
+    while True:
+        now = time.time()
+        if now - last_heartbeat >= 3.0:
+            last_heartbeat = now
+            touch_heartbeat()
+
+        if now - last_rescan > 5.0:
+            last_rescan = now
+            sync_wheel_devices(dev_entries)
+            for p in list(hires_accum.keys()):
+                if p not in dev_entries:
+                    del hires_accum[p]
+
+        if not dev_entries:
+            time.sleep(1.0)
+            sync_wheel_devices(dev_entries)
+            continue
+
+        if d is None:
+            connect_x11()
+
+        fd_to_entry = {dev.fd: (path, dev, has_wheel, has_hires) for path, (dev, has_wheel, has_hires) in dev_entries.items()}
+        try:
+            r, _, _ = select.select(list(fd_to_entry.keys()), [], [], 2.0)
+        except Exception:
+            for path in list(dev_entries.keys()):
+                dev, _, _ = dev_entries[path]
+                try:
+                    if dev.fd < 0:
+                        raise OSError("closed fd")
+                except Exception:
+                    dev_entries.pop(path, None)
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+            sync_wheel_devices(dev_entries)
+            continue
+
+        for fd in r:
+            entry = fd_to_entry.get(fd)
+            if entry is None:
+                continue
+            path, dev, has_wheel, has_hires = entry
+            try:
+                for ev in dev.read():
+                    if ev.type != ecodes.EV_REL:
+                        continue
+
+                    btn = 0
+                    clicks = 0
+                    if ev.code == ecodes.REL_WHEEL and ev.value != 0:
+                        btn = 4 if ev.value > 0 else 5
+                        clicks = max(1, min(abs(ev.value), 5))
+                    elif ev.code == ecodes.REL_HWHEEL and ev.value != 0:
+                        btn = 7 if ev.value > 0 else 6
+                        clicks = max(1, min(abs(ev.value), 5))
+                    elif (
+                        rel_wheel_hires is not None
+                        and ev.code == rel_wheel_hires
+                        and not has_wheel
+                        and has_hires
+                        and ev.value != 0
+                    ):
+                        acc = hires_accum.get(path, 0) + ev.value
+                        notches = int(acc / 120)
+                        if notches != 0:
+                            hires_accum[path] = acc - (notches * 120)
+                            btn = 4 if notches > 0 else 5
+                            clicks = max(1, min(abs(notches), 5))
+                        else:
+                            hires_accum[path] = acc
+
+                    if btn != 0 and clicks > 0:
+                        touch_heartbeat()
+                        last_heartbeat = time.time()
+                        inject_clicks(btn, clicks)
+            except Exception:
+                removed = dev_entries.pop(path, None)
+                if removed is not None:
+                    try:
+                        removed[0].close()
+                    except Exception:
+                        pass
+                hires_accum.pop(path, None)
+                sync_wheel_devices(dev_entries)
+                break
+
+
+if __name__ == "__main__":
+    main()

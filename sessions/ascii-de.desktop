@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=ASCII-DE (Wayland)
+Comment=Native Compiled ASCII Desktop Environment (Qt6 Wayland Compositor)
+Exec=/usr/bin/ascii-de --session
+TryExec=/usr/bin/ascii-de
+Type=Application
+DesktopNames=ASCII-DE

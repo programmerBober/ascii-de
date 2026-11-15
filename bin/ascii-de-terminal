@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Smart terminal launcher for ASCII-DE:
+# Prefers kitty (with ascii-de-kitty.conf when present), automatically falling back
+# to foot, konsole, alacritty, or xterm if kitty fails EGL/OpenGL initialization
+# (e.g. inside VMs with software llvmpipe rendering).
+
+set -u
+
+KITTY_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/ascii-de/xdg-config/ascii-de-kitty.conf"
+if [ ! -f "$KITTY_CONF" ]; then
+    KITTY_CONF="$HOME/.config/ascii-de/xdg-config/ascii-de-kitty.conf"
+fi
+
+run_fallback_terminal() {
+    local term
+    for term in alacritty foot konsole xterm; do
+        if command -v "$term" >/dev/null 2>&1; then
+            exec "$term" "$@"
+        fi
+    done
+    echo "ascii-de-terminal: no supported terminal emulator found (tried kitty, alacritty, foot, konsole, xterm)" >&2
+    exit 1
+}
+
+if command -v kitty >/dev/null 2>&1; then
+    KITTY_ARGS=()
+    if [ -f "$KITTY_CONF" ]; then
+        HAS_CFG=0
+        for arg in "$@"; do
+            case "$arg" in
+                -c|--config)
+                    HAS_CFG=1
+                    break
+                    ;;
+            esac
+        done
+        if [ "$HAS_CFG" -eq 0 ]; then
+            KITTY_ARGS=(-o "include=$KITTY_CONF")
+        fi
+    fi
+
+    START_TS="$(date +%s)"
+    set +e
+    kitty "${KITTY_ARGS[@]}" "$@"
+    RC=$?
+    set -e
+    END_TS="$(date +%s)"
+
+    if [ "$RC" -eq 0 ] || [ $((END_TS - START_TS)) -gt 3 ]; then
+        exit "$RC"
+    fi
+fi
+
+run_fallback_terminal "$@"

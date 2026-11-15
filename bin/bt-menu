@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+bt-menu: Sleek, high-performance Bluetooth connect menu for ASCII-DE / Wayland / X11.
+Supports Rofi, Fzf (terminal), Bluetui (TUI), and Blueman (GUI).
+"""
+
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+
+def resolve_backend():
+    env_bin = os.environ.get("ASCII_DE_BACKEND_BIN", "").strip()
+    if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        return env_bin
+    sibling = Path(__file__).resolve().parent / "ascii-de-backend"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
+    found = shutil.which("ascii-de-backend")
+    if found:
+        return found
+    home_bin = Path.home() / "bin" / "ascii-de-backend"
+    if home_bin.is_file() and os.access(home_bin, os.X_OK):
+        return str(home_bin)
+    return "ascii-de-backend"
+
+
+def detect_x11_display():
+    env_disp = os.environ.get("DISPLAY", "").strip()
+    if env_disp:
+        return env_disp
+    try:
+        nums = []
+        for entry in os.listdir("/tmp/.X11-unix"):
+            if entry.startswith("X") and entry[1:].isdigit():
+                nums.append(int(entry[1:]))
+        nums.sort(key=lambda n: (0 if 14 <= n <= 20 else 1, n))
+        if nums:
+            return f":{nums[0]}"
+    except OSError:
+        pass
+    return ":14"
+
+
+def run_cmd(cmd, check=False, timeout=10):
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        if check and res.returncode != 0:
+            return ""
+        return res.stdout.strip()
+    except Exception:
+        return ""
+
+
+def notify(title, msg, urgency="normal"):
+    run_cmd(["notify-send", "-u", urgency, "-a", "Bluetooth", title, msg])
+
+
+def get_controller_status():
+    out = run_cmd(["bluetoothctl", "show"])
+    powered = "Powered: yes" in out
+    name_match = re.search(r"Name:\s+(.*)", out)
+    name = name_match.group(1).strip() if name_match else "Bluetooth"
+    return powered, name
+
+
+def get_devices():
+    paired_out = run_cmd(["bluetoothctl", "devices", "Paired"])
+    connected_out = run_cmd(["bluetoothctl", "devices", "Connected"])
+
+    connected_macs = set()
+    for line in connected_out.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == "Device":
+            connected_macs.add(parts[1].upper())
+
+    devices = []
+    seen = set()
+    for line in paired_out.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) >= 3 and parts[0] == "Device":
+            mac = parts[1].upper()
+            name = parts[2]
+            if mac in seen:
+                continue
+            seen.add(mac)
+
+            is_connected = mac in connected_macs
+            battery = None
+            if is_connected:
+                info_out = run_cmd(["bluetoothctl", "info", mac])
+                bat_match = re.search(r"Battery Percentage:.*\((\d+)\)", info_out)
+                if bat_match:
+                    battery = f"{bat_match.group(1)}%"
+
+            devices.append({
+                "mac": mac,
+                "name": name,
+                "connected": is_connected,
+                "battery": battery
+            })
+
+    devices.sort(key=lambda d: (not d["connected"], d["name"].lower()))
+    return devices
+
+
+def toggle_power():
+    powered, _ = get_controller_status()
+    new_state = "off" if powered else "on"
+    run_cmd(["bluetoothctl", "power", new_state])
+    notify("Bluetooth", f"Power turned {new_state.upper()}")
+
+
+def connect_device(mac, name):
+    notify("Bluetooth", f"Connecting to {name}...")
+    out = run_cmd(["bluetoothctl", "connect", mac], timeout=15)
+    if "Connection successful" in out or "Connected: yes" in run_cmd(["bluetoothctl", "info", mac]):
+        notify("Bluetooth", f"Connected to {name}!", "normal")
+        run_cmd([resolve_backend(), "audio", "bt"])
+    else:
+        notify("Bluetooth", f"Failed to connect to {name}.\n{out[:80]}", "critical")
+
+
+def disconnect_device(mac, name):
+    notify("Bluetooth", f"Disconnecting {name}...")
+    run_cmd(["bluetoothctl", "disconnect", mac], timeout=10)
+    notify("Bluetooth", f"Disconnected {name}.", "normal")
+
+
+def remove_device(mac, name):
+    run_cmd(["bluetoothctl", "remove", mac], timeout=10)
+    notify("Bluetooth", f"Removed device {name}.", "normal")
+
+
+def scan_and_pair():
+    notify("Bluetooth", "Scanning for 7 seconds...")
+    proc = subprocess.Popen(["bluetoothctl", "scan", "on"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(7)
+    proc.terminate()
+    run_cmd(["bluetoothctl", "scan", "off"])
+
+    out = run_cmd(["bluetoothctl", "devices"])
+    candidates = []
+    for line in out.splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) >= 3 and parts[0] == "Device":
+            candidates.append((parts[1].upper(), parts[2]))
+
+    if not candidates:
+        notify("Bluetooth", "No devices found during scan.")
+        return
+
+    items = [f"{name} [{mac}]" for mac, name in candidates]
+    sel = show_menu("Select device to pair:", items)
+    if sel:
+        for mac, name in candidates:
+            if mac in sel:
+                notify("Bluetooth", f"Pairing with {name}...")
+                run_cmd(["bluetoothctl", "trust", mac])
+                run_cmd(["bluetoothctl", "pair", mac], timeout=20)
+                connect_device(mac, name)
+                break
+
+
+def show_menu(prompt, items):
+    env = os.environ.copy()
+    if not env.get("DISPLAY"):
+        env["DISPLAY"] = detect_x11_display()
+
+    has_rofi = shutil.which("rofi") is not None
+    is_tty = sys.stdin.isatty()
+
+    if ("--tui" in sys.argv or "-t" in sys.argv) and shutil.which("fzf") and is_tty:
+        try:
+            res = subprocess.run(["fzf", "--prompt", f"{prompt} "], input="\n".join(items), stdout=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                return res.stdout.strip()
+            return None
+        except Exception:
+            pass
+
+    if has_rofi and (not is_tty or "--rofi" in sys.argv or "--tui" not in sys.argv):
+        theme_path = os.path.expanduser("~/.config/rofi/config.rasi")
+        rofi_cmd = ["rofi", "-dmenu", "-p", prompt, "-i", "-no-custom"]
+        if os.path.exists(theme_path):
+            rofi_cmd.extend(["-theme", theme_path])
+        try:
+            res = subprocess.run(rofi_cmd, input="\n".join(items), stdout=subprocess.PIPE, text=True, env=env)
+            if res.returncode == 0:
+                return res.stdout.strip()
+            return None
+        except Exception:
+            pass
+
+    if shutil.which("fzf") and is_tty:
+        try:
+            res = subprocess.run(["fzf", "--prompt", f"{prompt} "], input="\n".join(items), stdout=subprocess.PIPE, text=True)
+            if res.returncode == 0:
+                return res.stdout.strip()
+            return None
+        except Exception:
+            pass
+
+    print(f"\n=== {prompt} ===")
+    for idx, it in enumerate(items, 1):
+        print(f" {idx}) {it}")
+    print(" q) Cancel\n")
+    try:
+        choice = input("Select [1-%d]: " % len(items)).strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(items):
+            return items[int(choice) - 1]
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return None
+
+
+def main():
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print("Usage: bt-menu [OPTIONS]")
+        print("\nOptions:")
+        print("  --rofi         Force Rofi graphical menu")
+        print("  --tui, -t      Interactive terminal menu (fzf / bluetui)")
+        print("  --gui          Launch full Blueman graphical manager")
+        print("  -h, --help     Show this help message")
+        return
+
+    if "--gui" in sys.argv or "gui" in sys.argv:
+        main_gui()
+        return
+
+    if "--tui" in sys.argv or "tui" in sys.argv:
+        if sys.stdin.isatty():
+            os.execvp("bluetui", ["bluetui"])
+        else:
+            subprocess.Popen(["kitty", "-e", "bluetui"])
+            return
+
+    powered, ctl_name = get_controller_status()
+    devices = get_devices()
+
+    menu_items = []
+    p_stat = "ON" if powered else "OFF"
+    menu_items.append(f"[●] Bluetooth: {p_stat} ({ctl_name}) -> Toggle")
+
+    if powered:
+        for d in devices:
+            if d["connected"]:
+                bat = f" [{d['battery']}]" if d["battery"] else ""
+                menu_items.append(f"[✓] {d['name']}{bat} (Connected)")
+            else:
+                menu_items.append(f"[ ] {d['name']} (Disconnected)")
+
+        menu_items.append("[+] Scan & Pair New Device...")
+        menu_items.append("[🎧] Switch Audio Sink to Bluetooth")
+        menu_items.append("[🖥️] Open Full Blueman GUI")
+        menu_items.append("[⌨️] Open Bluetui Terminal")
+    else:
+        menu_items.append("[●] Turn Bluetooth ON")
+
+    sel = show_menu("Bluetooth", menu_items)
+    if not sel:
+        return
+
+    if "Bluetooth: " in sel or "Turn Bluetooth ON" in sel:
+        toggle_power()
+        return
+
+    if "Scan & Pair" in sel:
+        scan_and_pair()
+        return
+
+    if "Switch Audio Sink" in sel:
+        run_cmd([resolve_backend(), "audio", "bt"])
+        notify("Audio", "Switched audio sink to Bluetooth headset.")
+        return
+
+    if "Open Full Blueman GUI" in sel:
+        main_gui()
+        return
+
+    if "Open Bluetui Terminal" in sel:
+        subprocess.Popen(["kitty", "-e", "bluetui"])
+        return
+
+    for d in devices:
+        if d["name"] in sel:
+            dev_prompt = f"{d['name']} ({'Connected' if d['connected'] else 'Disconnected'})"
+            if d["connected"]:
+                actions = [
+                    f"[x] Disconnect {d['name']}",
+                    f"[~] Reconnect {d['name']}",
+                    f"[🎧] Route Audio to {d['name']}",
+                    f"[!] Unpair / Remove {d['name']}",
+                    "[<] Back"
+                ]
+            else:
+                actions = [
+                    f"[✓] Connect {d['name']}",
+                    f"[!] Unpair / Remove {d['name']}",
+                    "[<] Back"
+                ]
+
+            act = show_menu(dev_prompt, actions)
+            if not act or "[<] Back" in act:
+                main()
+                return
+
+            if "Connect" in act:
+                connect_device(d["mac"], d["name"])
+            elif "Disconnect" in act:
+                disconnect_device(d["mac"], d["name"])
+            elif "Reconnect" in act:
+                disconnect_device(d["mac"], d["name"])
+                time.sleep(1)
+                connect_device(d["mac"], d["name"])
+            elif "Route Audio" in act:
+                run_cmd([resolve_backend(), "audio", "bt"])
+                notify("Audio", f"Routed audio to {d['name']}.")
+            elif "Remove" in act:
+                remove_device(d["mac"], d["name"])
+            return
+
+
+def main_gui():
+    disp = detect_x11_display()
+    if shutil.which("systemd-run"):
+        subprocess.Popen(["systemd-run", "--user", "--unit=blueman-manager", "env", f"DISPLAY={disp}", "blueman-manager"])
+    else:
+        env = os.environ.copy()
+        env["DISPLAY"] = disp
+        subprocess.Popen(["blueman-manager"], env=env, start_new_session=True)
+
+
+if __name__ == "__main__":
+    main()

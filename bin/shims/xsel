@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Wayland-aware xsel bridge for XWayland apps on ASCII-DE."""
+
+import os
+import subprocess
+import sys
+
+
+def candidate_sockets():
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    order = []
+    env_wd = os.environ.get("WAYLAND_DISPLAY", "").strip()
+    if env_wd:
+        order.append(env_wd)
+    for sock in ("wayland-ascii-0", "wayland-0"):
+        if sock not in order:
+            order.append(sock)
+    valid = []
+    for sock in order:
+        path = sock if sock.startswith("/") else os.path.join(runtime_dir, sock)
+        if os.path.exists(path):
+            valid.append(sock)
+    return valid
+
+
+def main():
+    selection = "primary"
+    mode = None
+    clear = False
+    for arg in sys.argv[1:]:
+        if arg in ("-b", "--clipboard"):
+            selection = "clipboard"
+        elif arg in ("-p", "--primary"):
+            selection = "primary"
+        elif arg in ("-s", "--secondary"):
+            selection = "secondary"
+        elif arg in ("-o", "--output"):
+            mode = "out"
+        elif arg in ("-i", "--input"):
+            mode = "in"
+        elif arg in ("-c", "--clear"):
+            clear = True
+        elif arg in ("-v", "--version"):
+            print("xsel version 1.2.1 (wl-clipboard bridge)")
+            return 0
+
+    sockets = candidate_sockets()
+    if not sockets:
+        return 1
+
+    if clear:
+        for sock in sockets:
+            env = os.environ.copy()
+            env["WAYLAND_DISPLAY"] = sock
+            cmd = ["wl-copy", "--clear"] + (["--primary"] if selection == "primary" else [])
+            subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return 0
+
+    if mode is None:
+        mode = "out" if sys.stdin.isatty() else "in"
+
+    if mode == "out":
+        for sock in sockets:
+            env = os.environ.copy()
+            env["WAYLAND_DISPLAY"] = sock
+            cmd = ["wl-paste"] + (["--primary"] if selection == "primary" else [])
+            res = subprocess.run(cmd, env=env, capture_output=True, timeout=3)
+            if res.returncode == 0:
+                sys.stdout.buffer.write(res.stdout)
+                return 0
+        return 1
+
+    payload = sys.stdin.buffer.read()
+    rc = 1
+    for sock in sockets:
+        env = os.environ.copy()
+        env["WAYLAND_DISPLAY"] = sock
+        cmd = ["wl-copy"] + (["--primary"] if selection == "primary" else [])
+        res = subprocess.run(cmd, input=payload, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+        if res.returncode == 0:
+            rc = 0
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

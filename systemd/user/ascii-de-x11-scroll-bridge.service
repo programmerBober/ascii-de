@@ -1,0 +1,14 @@
+[Unit]
+Description=ASCII-DE X11 Wheel Scroll Bridge
+After=graphical-session.target
+ConditionEnvironment=ASCII_DE_SESSION=1
+
+[Service]
+Type=simple
+Environment=DISPLAY=:14
+ExecStart=/usr/bin/ascii-de-x11-scroll-bridge
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

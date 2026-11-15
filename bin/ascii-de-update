@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_REPO="programmerBober/ascii-de"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ascii-de"
+CACHE_FILE="$CACHE_DIR/update-check.json"
+CACHE_TTL=86400
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ascii-de-update --check [--json] [--force] [--repo <owner/repo>]
+  ascii-de-update --apply [--binary | --source] [--local-pkg <path>] [--repo <owner/repo>] [--yes] [--force]
+  ascii-de-update --help
+
+Options:
+  --check              Check for a newer release (24h cached in ~/.cache/ascii-de/update-check.json)
+  --json               Emit machine-readable JSON on --check
+  --apply              Download/verify and apply update, run backend config migrations
+  --binary             Force binary package update (GitHub Release .pkg.tar.zst / .tar.zst)
+  --source             Force source update (git pull --ff-only + rebuild)
+  --local-pkg <path>   Apply an update from a local .pkg.tar.zst or .tar.zst file
+  --repo <owner/repo>  Override GitHub repository (default: programmerBober/ascii-de)
+  --yes, -y            Non-interactive pacman/confirmation
+  --force              Bypass 24h check cache or reinstall matching version
+EOF
+}
+
+find_install_meta() {
+    local candidate
+    for candidate in \
+        "/usr/share/ascii-de/install-meta.json" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/ascii-de/install-meta.json"; do
+        if [[ -f "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+read_meta_field() {
+    local meta_file="$1" field="$2" default="${3:-}"
+    if [[ -n "$meta_file" && -f "$meta_file" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r --arg f "$field" --arg d "$default" '.[$f] // $d | tostring' "$meta_file" 2>/dev/null || printf '%s' "$default"
+    else
+        printf '%s' "$default"
+    fi
+}
+
+detect_current_version() {
+    local meta_file="$1" v=""
+    if [[ -n "$meta_file" ]]; then
+        v="$(read_meta_field "$meta_file" "version" "")"
+    fi
+    if [[ -z "$v" ]] && command -v ascii-de-backend >/dev/null 2>&1; then
+        v="$(ascii-de-backend version --json 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true)"
+    fi
+    if [[ -z "$v" ]] && command -v ascii-de-compositor >/dev/null 2>&1; then
+        v="$(ascii-de-compositor --version 2>/dev/null | awk '{print $NF}' | tr -d 'v' || true)"
+    fi
+    if [[ -z "$v" && -f "$SCRIPT_DIR/../VERSION" ]]; then
+        v="$(tr -d '[:space:]' < "$SCRIPT_DIR/../VERSION")"
+    fi
+    v="${v#v}"
+    if [[ -z "$v" ]]; then
+        v="0.1.0"
+    fi
+    printf '%s' "$v"
+}
+
+version_gt() {
+    local cur="${1#v}" latest="${2#v}"
+    [[ -n "$cur" && -n "$latest" && "$cur" != "$latest" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$cur" "$latest" | sort -V | tail -n1)" == "$latest" ]]
+}
+
+emit_check_json() {
+    local current="$1" latest="$2" avail="$3" url="$4" checked_at="$5" offline="$6" err="$7" repo="$8" checked_epoch="$9"
+    jq -n \
+        --arg current "$current" \
+        --arg latest "$latest" \
+        --argjson updateAvailable "$avail" \
+        --arg releaseUrl "$url" \
+        --arg checkedAt "$checked_at" \
+        --argjson offline "$offline" \
+        --arg error "$err" \
+        --arg repo "$repo" \
+        --argjson checkedEpoch "$checked_epoch" \
+        '{
+            current: $current,
+            latest: $latest,
+            updateAvailable: $updateAvailable,
+            releaseUrl: $releaseUrl,
+            checkedAt: $checkedAt,
+            offline: $offline,
+            error: $error,
+            repo: $repo,
+            checkedEpoch: $checkedEpoch
+        }'
+}
+
+do_check() {
+    local repo="$1" json_mode="$2" force="$3" meta_file="$4"
+    local current now_epoch now_iso
+    current="$(detect_current_version "$meta_file")"
+    now_epoch="$(date +%s)"
+    now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local default_url="https://github.com/${repo}/releases"
+
+    if [[ "$force" -eq 0 && -f "$CACHE_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        local cached_epoch cached_repo
+        cached_epoch="$(jq -r '.checkedEpoch // 0' "$CACHE_FILE" 2>/dev/null || echo 0)"
+        cached_repo="$(jq -r '.repo // ""' "$CACHE_FILE" 2>/dev/null || echo "")"
+        if [[ "$cached_repo" == "$repo" && "$cached_epoch" =~ ^[0-9]+$ ]] && (( now_epoch - cached_epoch < CACHE_TTL )); then
+            local cached_latest cached_url cached_at cached_avail
+            cached_latest="$(jq -r '.latest // ""' "$CACHE_FILE" 2>/dev/null || true)"
+            cached_url="$(jq -r --arg d "$default_url" '.releaseUrl // $d' "$CACHE_FILE" 2>/dev/null || echo "$default_url")"
+            cached_at="$(jq -r --arg d "$now_iso" '.checkedAt // $d' "$CACHE_FILE" 2>/dev/null || echo "$now_iso")"
+            if [[ -n "$cached_latest" ]]; then
+                cached_avail="false"
+                if version_gt "$current" "$cached_latest"; then
+                    cached_avail="true"
+                fi
+                if [[ "$json_mode" -eq 1 ]]; then
+                    emit_check_json "$current" "$cached_latest" "$cached_avail" "$cached_url" "$cached_at" "false" "" "$repo" "$cached_epoch"
+                else
+                    echo "Current: $current | Latest: $cached_latest | Update available: $cached_avail ($cached_url)"
+                fi
+                return 0
+            fi
+        fi
+    fi
+
+    local api_resp="" latest="" release_url="$default_url" offline="false" err_msg=""
+    if api_resp="$(curl -fsSL --max-time 4 -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null)"; then
+        latest="$(printf '%s' "$api_resp" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+        release_url="$(printf '%s' "$api_resp" | jq -r --arg d "$default_url" '.html_url // $d' 2>/dev/null || echo "$default_url")"
+    else
+        # Fallback to tags API if no GitHub Release exists yet
+        local tags_resp=""
+        if tags_resp="$(curl -fsSL --max-time 4 -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/tags?per_page=1" 2>/dev/null)"; then
+            latest="$(printf '%s' "$tags_resp" | jq -r '.[0].name // empty' 2>/dev/null || true)"
+            if [[ -n "$latest" ]]; then
+                release_url="https://github.com/${repo}/releases/tag/${latest}"
+            fi
+        else
+            offline="true"
+            err_msg="Unable to reach GitHub API (offline or no release yet)"
+        fi
+    fi
+
+    latest="${latest#v}"
+    if [[ -z "$latest" ]]; then
+        latest="$current"
+        if [[ "$offline" == "false" ]]; then
+            err_msg="No releases or tags published yet"
+        fi
+    fi
+
+    local avail="false"
+    if version_gt "$current" "$latest"; then
+        avail="true"
+    fi
+
+    local payload
+    payload="$(emit_check_json "$current" "$latest" "$avail" "$release_url" "$now_iso" "$offline" "$err_msg" "$repo" "$now_epoch")"
+
+    if [[ "$offline" == "false" ]]; then
+        mkdir -p "$CACHE_DIR"
+        local tmp_cache="${CACHE_FILE}.tmp.$$"
+        printf '%s\n' "$payload" > "$tmp_cache"
+        mv -f "$tmp_cache" "$CACHE_FILE"
+    fi
+
+    if [[ "$json_mode" -eq 1 ]]; then
+        printf '%s\n' "$payload"
+    else
+        if [[ "$offline" == "true" ]]; then
+            echo "Current: $current | Offline ($err_msg)"
+        elif [[ "$avail" == "true" ]]; then
+            echo "Update available: $current -> $latest ($release_url)"
+        else
+            echo "ASCII-DE is up to date ($current)."
+        fi
+    fi
+}
+
+run_post_update_hooks() {
+    if command -v ascii-de-backend >/dev/null 2>&1; then
+        ascii-de-backend migrate >/dev/null 2>&1 || true
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        if systemctl --user is-active --quiet ascii-de-x11-scroll-bridge.service 2>/dev/null; then
+            systemctl --user restart ascii-de-x11-scroll-bridge.service || true
+        fi
+    fi
+
+    # Refresh cache after successful apply
+    rm -f "$CACHE_FILE"
+
+    echo "Update applied cleanly. User configs in ~/.config/ascii-de/ were preserved."
+    if pgrep -u "$USER" -f "/ascii-de-compositor" >/dev/null 2>&1; then
+        echo "Note: running ascii-de-compositor was NOT stopped. Run 'ascii-de restart' or log out/in when ready."
+    fi
+}
+
+install_pacman_pkg() {
+    local pkg_path="$1" yes_mode="$2"
+    local pac_flags=(-U --needed)
+    if [[ "$yes_mode" -eq 1 ]]; then
+        pac_flags+=(--noconfirm)
+    fi
+    if [[ "$EUID" -eq 0 ]]; then
+        pacman "${pac_flags[@]}" "$pkg_path"
+    else
+        sudo pacman "${pac_flags[@]}" "$pkg_path"
+    fi
+}
+
+verify_sha256_if_present() {
+    local file_path="$1" sum_file="$2" required="$3"
+    local base_name dir_name
+    base_name="$(basename "$file_path")"
+    dir_name="$(dirname "$file_path")"
+
+    if [[ ! -f "$sum_file" ]]; then
+        if [[ "$required" -eq 1 ]]; then
+            echo "ascii-de-update: missing SHA256SUMS file: $sum_file" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    local match_line
+    match_line="$(grep -E "(^|[[:space:]]|\*)${base_name}$" "$sum_file" | head -n 1 || true)"
+    if [[ -z "$match_line" ]]; then
+        if [[ "$required" -eq 1 ]]; then
+            echo "ascii-de-update: $base_name not listed in $sum_file" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    (cd "$dir_name" && printf '%s\n' "$match_line" | sha256sum -c -)
+}
+
+apply_local_pkg() {
+    local pkg_path="$1" yes_mode="$2"
+    if [[ ! -f "$pkg_path" ]]; then
+        echo "ascii-de-update: package file not found: $pkg_path" >&2
+        exit 1
+    fi
+    pkg_path="$(realpath "$pkg_path")"
+    local sum_file="$(dirname "$pkg_path")/SHA256SUMS"
+    verify_sha256_if_present "$pkg_path" "$sum_file" 0
+
+    case "$pkg_path" in
+        *.pkg.tar.zst|*.pkg.tar.xz)
+            install_pacman_pkg "$pkg_path" "$yes_mode"
+            ;;
+        *.tar.zst|*.tar.gz)
+            local prefix="${XDG_DATA_HOME:-$HOME/.local}"
+            prefix="$(dirname "$prefix")"
+            [[ "$prefix" == "$HOME/.local" ]] || prefix="$HOME/.local"
+            local stage
+            stage="$(mktemp -d)"
+            trap 'rm -rf "$stage"' RETURN
+            tar --zstd -xf "$pkg_path" -C "$stage" 2>/dev/null || tar -xf "$pkg_path" -C "$stage"
+            local root_dir="$stage"
+            if [[ ! -d "$stage/bin" ]]; then
+                local sub
+                sub="$(find "$stage" -mindepth 1 -maxdepth 1 -type d | head -n 1 || true)"
+                [[ -n "$sub" && -d "$sub/bin" ]] && root_dir="$sub"
+            fi
+            mkdir -p "$prefix/bin" "$prefix/lib/ascii-de/bin" "$prefix/share/ascii-de/ui"
+            cp -a "$root_dir/bin/." "$prefix/bin/"
+            [[ -d "$root_dir/lib/ascii-de/bin" ]] && cp -a "$root_dir/lib/ascii-de/bin/." "$prefix/lib/ascii-de/bin/"
+            [[ -d "$root_dir/share/ascii-de" ]] && cp -a "$root_dir/share/ascii-de/." "$prefix/share/ascii-de/"
+            ;;
+        *)
+            echo "ascii-de-update: unsupported package format: $pkg_path" >&2
+            exit 1
+            ;;
+    esac
+
+    run_post_update_hooks
+}
+
+apply_source_update() {
+    local repo_dir="$1" yes_mode="$2" install_method="$3"
+    if [[ -z "$repo_dir" || ! -d "$repo_dir/.git" ]]; then
+        if [[ -d "$SCRIPT_DIR/../.git" ]]; then
+            repo_dir="$(cd "$SCRIPT_DIR/.." && pwd)"
+        else
+            echo "ascii-de-update: source repository not found (set repoDir in install-meta.json or run from git clone)." >&2
+            exit 1
+        fi
+    fi
+
+    echo "Pulling latest commits in $repo_dir..."
+    git -C "$repo_dir" pull --ff-only
+
+    if [[ -x "$repo_dir/install.sh" ]]; then
+        local inst_flags=(--local)
+        [[ "$yes_mode" -eq 1 ]] && inst_flags+=(--yes)
+        "$repo_dir/install.sh" "${inst_flags[@]}"
+    else
+        echo "ascii-de-update: install.sh not found in $repo_dir" >&2
+        exit 1
+    fi
+
+    run_post_update_hooks
+}
+
+apply_binary_release() {
+    local repo="$1" yes_mode="$2" force="$3" meta_file="$4"
+    local current
+    current="$(detect_current_version "$meta_file")"
+
+    local api_resp
+    if ! api_resp="$(curl -fsSL --max-time 10 -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${repo}/releases/latest")"; then
+        echo "ascii-de-update: failed to query latest release from GitHub (${repo})." >&2
+        exit 1
+    fi
+
+    local tag latest
+    tag="$(printf '%s' "$api_resp" | jq -r '.tag_name // empty')"
+    latest="${tag#v}"
+    if [[ -z "$latest" ]]; then
+        echo "ascii-de-update: latest release has no tag_name." >&2
+        exit 1
+    fi
+
+    if [[ "$force" -eq 0 ]] && ! version_gt "$current" "$latest"; then
+        echo "ASCII-DE is already up to date ($current)."
+        exit 0
+    fi
+
+    local pkg_url pkg_name sum_url
+    pkg_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$")) | .browser_download_url' | head -n 1)"
+    pkg_name="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$")) | .name' | head -n 1)"
+    sum_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name == "SHA256SUMS") | .browser_download_url' | head -n 1)"
+
+    if [[ -z "$pkg_url" || -z "$sum_url" ]]; then
+        echo "ascii-de-update: release ${tag} is missing .pkg.tar.zst or SHA256SUMS asset." >&2
+        exit 1
+    fi
+
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf "$tmp_dir"' EXIT
+
+    echo "Downloading ${pkg_name} and SHA256SUMS..."
+    curl -fsSL --max-time 120 -o "$tmp_dir/$pkg_name" "$pkg_url"
+    curl -fsSL --max-time 15 -o "$tmp_dir/SHA256SUMS" "$sum_url"
+
+    verify_sha256_if_present "$tmp_dir/$pkg_name" "$tmp_dir/SHA256SUMS" 1
+    install_pacman_pkg "$tmp_dir/$pkg_name" "$yes_mode"
+    run_post_update_hooks
+}
+
+ACTION=""
+JSON_MODE=0
+FORCE=0
+YES_MODE=0
+MODE_OVERRIDE=""
+LOCAL_PKG=""
+REPO_OVERRIDE=""
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        --check)
+            ACTION="check"
+            shift
+            ;;
+        --apply)
+            ACTION="apply"
+            shift
+            ;;
+        --json)
+            JSON_MODE=1
+            shift
+            ;;
+        --force)
+            FORCE=1
+            shift
+            ;;
+        --yes|-y)
+            YES_MODE=1
+            shift
+            ;;
+        --binary)
+            MODE_OVERRIDE="binary"
+            shift
+            ;;
+        --source)
+            MODE_OVERRIDE="source"
+            shift
+            ;;
+        --local-pkg)
+            LOCAL_PKG="${2:?--local-pkg requires a path}"
+            shift 2
+            ;;
+        --repo)
+            REPO_OVERRIDE="${2:?--repo requires owner/name}"
+            shift 2
+            ;;
+        -h|--help|help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "ascii-de-update: unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+META_FILE="$(find_install_meta || true)"
+REPO="${REPO_OVERRIDE:-$(read_meta_field "$META_FILE" "repo" "$DEFAULT_REPO")}"
+INSTALL_METHOD="$(read_meta_field "$META_FILE" "installMethod" "pacman")"
+REPO_DIR="$(read_meta_field "$META_FILE" "repoDir" "")"
+
+if [[ -z "$ACTION" ]]; then
+    if [[ -n "$LOCAL_PKG" ]]; then
+        ACTION="apply"
+    else
+        ACTION="check"
+    fi
+fi
+
+case "$ACTION" in
+    check)
+        do_check "$REPO" "$JSON_MODE" "$FORCE" "$META_FILE"
+        ;;
+    apply)
+        if [[ -n "$LOCAL_PKG" ]]; then
+            apply_local_pkg "$LOCAL_PKG" "$YES_MODE"
+        elif [[ "$MODE_OVERRIDE" == "source" || ( -z "$MODE_OVERRIDE" && "$INSTALL_METHOD" == "source" ) ]]; then
+            apply_source_update "$REPO_DIR" "$YES_MODE" "$INSTALL_METHOD"
+        else
+            apply_binary_release "$REPO" "$YES_MODE" "$FORCE" "$META_FILE"
+        fi
+        ;;
+esac

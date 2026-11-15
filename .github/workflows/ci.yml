@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  arch-build-and-lint:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Initialize keyring and install build/runtime dependencies
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja rust gcc namcap \
+            qt6-base qt6-declarative qt6-wayland wayland kwin libkscreen \
+            xwayland-satellite xorg-xwayland wl-clipboard pam dbus chafa \
+            libpulse wireplumber kitty ttf-jetbrains-mono breeze-icons \
+            playerctl brightnessctl bluez-utils rofi bluetui \
+            python python-pyqt6 python-evdev python-xlib jq curl
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: QML lint (ui/*.qml)
+        run: |
+          if [[ -x /usr/lib/qt6/bin/qmllint ]]; then
+            QMLLINT="/usr/lib/qt6/bin/qmllint"
+          else
+            QMLLINT="$(command -v qmllint6 || command -v qmllint-qt6 || command -v qmllint)"
+          fi
+          "$QMLLINT" -I ui ui/*.qml
+
+      - name: Rust clippy & unit tests
+        run: |
+          cargo clippy --manifest-path backend/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path backend/Cargo.toml --locked
+
+      - name: CMake Release build
+        run: |
+          cmake -B compositor/build -S compositor -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build compositor/build -j"$(nproc)"
+
+      - name: Build Arch package (makepkg) & run namcap
+        run: |
+          VER="$(tr -d '[:space:]' < VERSION)"
+          STAGE="$(mktemp -d)"
+          mkdir -p "$STAGE/ascii-de-${VER}"
+          tar --exclude='./.git' --exclude='./compositor/build' --exclude='./backend/target' -cf - . | tar -C "$STAGE/ascii-de-${VER}" -xf -
+          tar -C "$STAGE" -czf "packaging/arch/ascii-de-${VER}.tar.gz" "ascii-de-${VER}"
+          rm -rf "$STAGE"
+          useradd -m builder
+          chown -R builder:builder .
+          su - builder -c "cd '$PWD/packaging/arch' && makepkg --noconfirm"
+          namcap packaging/arch/PKGBUILD
+          namcap packaging/arch/*.pkg.tar.zst

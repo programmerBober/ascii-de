@@ -1,0 +1,439 @@
+#!/usr/bin/env bash
+# Launcher for ASCII-DE native Qt6 Wayland Compositor
+
+set -e
+
+SELF_PATH="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SELF_PATH")" && pwd)"
+
+resolve_bin() {
+    local env_val="$1"
+    local name="$2"
+    if [ -n "$env_val" ] && [ -x "$env_val" ]; then
+        printf '%s' "$env_val"
+        return 0
+    fi
+    if [ -x "$SCRIPT_DIR/$name" ]; then
+        printf '%s' "$SCRIPT_DIR/$name"
+        return 0
+    fi
+    if [ "$name" = "ascii-de-compositor" ] && [ -x "$SCRIPT_DIR/../compositor/build/ascii-de-compositor" ]; then
+        printf '%s' "$SCRIPT_DIR/../compositor/build/ascii-de-compositor"
+        return 0
+    fi
+    if [ "$name" = "ascii-de-backend" ] && [ -x "$SCRIPT_DIR/../backend/target/release/ascii-de-backend" ]; then
+        printf '%s' "$SCRIPT_DIR/../backend/target/release/ascii-de-backend"
+        return 0
+    fi
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+        return 0
+    fi
+    if [ -x "$HOME/bin/$name" ]; then
+        printf '%s' "$HOME/bin/$name"
+        return 0
+    fi
+    if [ -x "/usr/bin/$name" ]; then
+        printf '%s' "/usr/bin/$name"
+        return 0
+    fi
+    return 1
+}
+
+resolve_ui_dir() {
+    local cand
+    for cand in \
+        "${ASCII_DE_UI_DIR:-}" \
+        "${ASCII_DE_QML_DIR:-}" \
+        "/usr/share/ascii-de/ui" \
+        "$HOME/.local/share/ascii-de/ui" \
+        "$SCRIPT_DIR/../ui" \
+        "$HOME/Projecten/ascii-de/ui"; do
+        if [ -n "$cand" ] && [ -f "$cand/MainCompositor.qml" ]; then
+            printf '%s' "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+prepend_shim_paths() {
+    local shim_dir
+    for shim_dir in \
+        "/usr/lib/ascii-de/bin" \
+        "$HOME/.local/lib/ascii-de/bin" \
+        "$SCRIPT_DIR/shims"; do
+        if [ -d "$shim_dir" ]; then
+            case ":$PATH:" in
+                *":$shim_dir:"*) ;;
+                *) export PATH="$shim_dir:$PATH" ;;
+            esac
+        fi
+    done
+}
+
+COMPOSITOR_BIN="$(resolve_bin "${ASCII_DE_COMPOSITOR_BIN:-}" "ascii-de-compositor" || true)"
+BACKEND_BIN="$(resolve_bin "${ASCII_DE_BACKEND_BIN:-}" "ascii-de-backend" || true)"
+AUTOSTART_BIN="$(resolve_bin "${ASCII_DE_AUTOSTART_BIN:-}" "ascii-de-autostart" || true)"
+SCROLL_BRIDGE_BIN="$(resolve_bin "" "ascii-de-x11-scroll-bridge" || true)"
+HW_GUARD_BIN="$(resolve_bin "" "terminal-plasma-hw-guard" || true)"
+UI_DIR="$(resolve_ui_dir || true)"
+QML_ENTRY="${UI_DIR:+$UI_DIR/MainCompositor.qml}"
+
+[ -n "$UI_DIR" ] && export ASCII_DE_QML_DIR="$UI_DIR"
+[ -n "$BACKEND_BIN" ] && export ASCII_DE_BACKEND_BIN="$BACKEND_BIN"
+
+ensure_scroll_bridge_async() {
+    [ -n "$SCROLL_BRIDGE_BIN" ] || return 0
+    (
+        # Wait briefly for XWayland/xwayland-satellite socket inside session
+        local i xsock disp_num found_disp=""
+        for i in $(seq 1 40); do
+            if [ -n "${DISPLAY:-}" ]; then
+                found_disp="$DISPLAY"
+                break
+            fi
+            for xsock in /tmp/.X11-unix/X*; do
+                [ -e "$xsock" ] || continue
+                disp_num="${xsock##*/X}"
+                case "$disp_num" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                if [ "$disp_num" -ge 14 ] && [ "$disp_num" -le 20 ]; then
+                    found_disp=":$disp_num"
+                    break
+                fi
+            done
+            [ -n "$found_disp" ] && break
+            sleep 0.25
+        done
+        [ -n "$found_disp" ] || exit 0
+        if pgrep -u "$USER" -f "ascii-de-x11-scroll-bridge" >/dev/null 2>&1; then
+            exit 0
+        fi
+        if command -v systemctl >/dev/null 2>&1 && systemctl --user list-unit-files ascii-de-x11-scroll-bridge.service >/dev/null 2>&1; then
+            systemctl --user set-environment "DISPLAY=$found_disp" ASCII_DE_SESSION=1 >/dev/null 2>&1 || true
+            systemctl --user start ascii-de-x11-scroll-bridge.service >/dev/null 2>&1 && exit 0
+        fi
+        DISPLAY="$found_disp" nohup "$SCROLL_BRIDGE_BIN" >/dev/null 2>&1 &
+    ) &
+}
+
+# Forward subcommands
+case "${1:-}" in
+    version|--version|-v)
+        if [ -f "/usr/share/ascii-de/VERSION" ]; then
+            printf 'ascii-de %s\n' "$(head -n 1 /usr/share/ascii-de/VERSION)"
+        elif [ -f "$SCRIPT_DIR/../VERSION" ]; then
+            printf 'ascii-de %s\n' "$(head -n 1 "$SCRIPT_DIR/../VERSION")"
+        elif [ -n "$COMPOSITOR_BIN" ] && [ -x "$COMPOSITOR_BIN" ]; then
+            exec "$COMPOSITOR_BIN" --version
+        elif [ -n "$BACKEND_BIN" ] && [ -x "$BACKEND_BIN" ]; then
+            exec "$BACKEND_BIN" version
+        else
+            echo "ascii-de 0.1.0"
+        fi
+        exit 0
+        ;;
+    update)
+        shift
+        UPDATE_BIN="$(resolve_bin "" "ascii-de-update" || true)"
+        if [ -z "$UPDATE_BIN" ] || [ ! -x "$UPDATE_BIN" ]; then
+            echo "ascii-de: ascii-de-update not found on PATH or in $SCRIPT_DIR" >&2
+            exit 1
+        fi
+        exec "$UPDATE_BIN" "$@"
+        ;;
+    displays|monitors)
+        shift
+        if [ -z "$BACKEND_BIN" ] || [ ! -x "$BACKEND_BIN" ]; then
+            echo "ascii-de: backend binary not found or not executable" >&2
+            exit 1
+        fi
+        if [ "$#" -eq 0 ]; then
+            exec "$BACKEND_BIN" displays list
+        fi
+        exec "$BACKEND_BIN" displays "$@"
+        ;;
+    restart|--restart)
+        shift
+        if [ ! -t 0 ] && [ "${ASCII_DE_ALLOW_SCRIPT_RESTART:-0}" != "1" ]; then
+            echo "ascii-de: automated/unattended restart blocked by user safety policy." >&2
+            exit 1
+        fi
+        FORCE=0
+        if [ "${1:-}" = "--force" ] || [ "${1:-}" = "-f" ]; then
+            FORCE=1
+            shift
+        fi
+        COMP_PID="$(pgrep -u "$USER" -f "/ascii-de-compositor" | head -n 1 || true)"
+        if [ -n "$COMP_PID" ] && pgrep -u "$USER" -f "kwin_wayland.*exit-with-session" >/dev/null 2>&1; then
+            if ! tr '\0' '\n' < "/proc/$COMP_PID/environ" 2>/dev/null | grep -qx "ASCII_DE_SUPERVISED=1"; then
+                if [ "$FORCE" -ne 1 ]; then
+                    echo "ascii-de: current session predates hot-restart supervision." >&2
+                    echo "Log out once (or run 'ascii-de restart --force' to end this session) to enable zero-logout 'ascii-de restart'." >&2
+                    exit 1
+                fi
+            else
+                touch "${XDG_RUNTIME_DIR:-/tmp}/ascii-de-restart"
+            fi
+            kill -TERM "$COMP_PID"
+            echo "ascii-de: restarting compositor (PID $COMP_PID)..."
+            exit 0
+        fi
+        if [ -n "$COMP_PID" ]; then
+            kill -TERM "$COMP_PID"
+            for _ in $(seq 1 30); do
+                kill -0 "$COMP_PID" 2>/dev/null || break
+                sleep 0.1
+            done
+        fi
+        if command -v systemd-run >/dev/null 2>&1; then
+            systemd-run --user --unit="ascii-de-restart-$(date +%s)" "$SELF_PATH" "$@" >/dev/null 2>&1 &
+        else
+            nohup "$SELF_PATH" "$@" >/dev/null 2>&1 &
+        fi
+        echo "ascii-de: restarted nested session."
+        exit 0
+        ;;
+esac
+
+MODE="nested"
+EXTRA_ARGS=()
+HAS_QML_ARG=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --nested)
+            MODE="nested"
+            shift
+            ;;
+        --session)
+            MODE="session"
+            shift
+            ;;
+        --fullscreen)
+            export ASCII_DE_FULLSCREEN=1
+            EXTRA_ARGS+=("--fullscreen")
+            shift
+            ;;
+        --all-monitors)
+            export ASCII_DE_ALL_MONITORS=1
+            EXTRA_ARGS+=("--all-monitors")
+            shift
+            ;;
+        --qml)
+            HAS_QML_ARG=1
+            EXTRA_ARGS+=("$1")
+            if [ "$#" -gt 1 ]; then
+                EXTRA_ARGS+=("$2")
+                shift 2
+            else
+                shift
+            fi
+            ;;
+        --help|-h)
+            cat <<'EOF'
+Usage: ascii-de [--nested | --session] [--fullscreen] [--all-monitors] [--socket <name>] [--qml <path>]
+       ascii-de version | --version
+       ascii-de update [--check | --apply ...]
+       ascii-de restart [--force]
+       ascii-de displays [list | save <json> | apply | reset]
+       ascii-de monitors [list | save <json> | apply | reset]
+
+Modes:
+  --nested        Run ASCII-DE inside the current Wayland/X11 desktop (default, 1600x960)
+  --session       Run ASCII-DE as a standalone multi-monitor DRM session (KWin Wayland host or EGLFS fallback)
+  --fullscreen    Start nested window fullscreen
+  --all-monitors  Spawn one compositor output window per connected display in nested mode
+EOF
+            exit 0
+            ;;
+        *)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$COMPOSITOR_BIN" ] || [ ! -x "$COMPOSITOR_BIN" ]; then
+    echo "ascii-de: compositor binary not found or not executable" >&2
+    exit 1
+fi
+
+if [ "$HAS_QML_ARG" -eq 0 ]; then
+    if [ -z "$QML_ENTRY" ] || [ ! -f "$QML_ENTRY" ]; then
+        echo "ascii-de: MainCompositor.qml not found (set ASCII_DE_UI_DIR or install UI files)" >&2
+        exit 1
+    fi
+    EXTRA_ARGS=("--qml" "$QML_ENTRY" "${EXTRA_ARGS[@]}")
+fi
+
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/ascii-de"
+
+if [ "${ASCII_DE_IN_KWIN_SESSION:-0}" = "1" ] && [ "$MODE" = "nested" ]; then
+    # Running inside KWin Wayland DRM host: apply display/audio hooks if present,
+    # then restore normal XDG paths so apps inherit native ~/.config & ~/.local/share.
+    unset ASCII_DE_IN_KWIN_SESSION
+
+    if [ -n "$HW_GUARD_BIN" ] && [ -x "$HW_GUARD_BIN" ]; then
+        "$HW_GUARD_BIN" || true
+    fi
+    if [ -n "$BACKEND_BIN" ] && [ -x "$BACKEND_BIN" ]; then
+        if [ -f "$HOME/.config/ascii-de/monitors.json" ] && { [ ! -f "$HOME/.config/kwinoutputconfig.json" ] || [ "$HOME/.config/ascii-de/monitors.json" -nt "$HOME/.config/kwinoutputconfig.json" ]; }; then
+            "$BACKEND_BIN" displays apply >/dev/null 2>&1 || true
+        fi
+        "$BACKEND_BIN" theme sync-apps >/dev/null 2>&1 || true
+    fi
+
+    export XDG_CONFIG_HOME="$HOME/.config"
+    export XDG_DATA_HOME="$HOME/.local/share"
+    export XDG_STATE_HOME="$HOME/.local/state"
+    export XDG_CACHE_HOME="$HOME/.cache"
+    export XDG_CURRENT_DESKTOP="ASCII-DE"
+    export DESKTOP_SESSION="ascii-de"
+    export ASCII_DE_SESSION=1
+    export ASCII_DE_FULLSCREEN=1
+    export ASCII_DE_ALL_MONITORS=1
+    export QT_QPA_PLATFORM="wayland"
+    prepend_shim_paths
+
+    if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --systemd XDG_CURRENT_DESKTOP DESKTOP_SESSION WAYLAND_DISPLAY ASCII_DE_SESSION PATH >/dev/null 2>&1 || true
+    fi
+
+    export ASCII_DE_SUPERVISED=1
+    RESTART_FLAG="${XDG_RUNTIME_DIR:-/tmp}/ascii-de-restart"
+
+    if [ -n "$AUTOSTART_BIN" ] && [ -x "$AUTOSTART_BIN" ]; then
+        "$AUTOSTART_BIN" &
+    fi
+    ensure_scroll_bridge_async
+
+    while true; do
+        rm -f "$RESTART_FLAG"
+        mkdir -p "$HOME/.cache/ascii-de"
+        [ -f "$HOME/.cache/ascii-de/session.log" ] && mv -f "$HOME/.cache/ascii-de/session.log" "$HOME/.cache/ascii-de/session.log.prev"
+        set +e
+        "$COMPOSITOR_BIN" --fullscreen --all-monitors "${EXTRA_ARGS[@]}" >"$HOME/.cache/ascii-de/session.log" 2>&1
+        rc=$?
+        set -e
+        if [ -f "$RESTART_FLAG" ]; then
+            rm -f "$RESTART_FLAG"
+            sleep 0.2
+            continue
+        fi
+        exit "$rc"
+    done
+fi
+
+if [ "$MODE" = "session" ]; then
+    export XDG_CURRENT_DESKTOP="ASCII-DE"
+    export DESKTOP_SESSION="ascii-de"
+    export ASCII_DE_SESSION=1
+    export ASCII_DE_ALL_MONITORS=1
+    export ASCII_DE_FULLSCREEN=1
+    export QT_AUTO_SCREEN_SCALE_FACTOR=1
+    prepend_shim_paths
+
+    # NVIDIA Wayland / DRM stability (only when NVIDIA DRM device is present)
+    if [ -e /dev/nvidia0 ] || [ -d /sys/module/nvidia_drm ]; then
+        export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
+        export LIBVA_DRIVER_NAME="${LIBVA_DRIVER_NAME:-nvidia}"
+        export NVD_BACKEND="${NVD_BACKEND:-direct}"
+        export KWIN_DRM_USE_EGL_STREAMS=0
+    fi
+
+    if command -v kwin_wayland >/dev/null 2>&1; then
+        KWIN_HOST_CFG="$HOME/.config/ascii-de/kwin-host"
+        mkdir -p "$KWIN_HOST_CFG" "$HOME/.local/share/ascii-de-host" "$HOME/.local/state/ascii-de-host" "$HOME/.cache/ascii-de-host" "$HOME/.cache/ascii-de"
+        if [ -f "$HOME/.config/kwinoutputconfig.json" ]; then
+            ln -sfn "$HOME/.config/kwinoutputconfig.json" "$KWIN_HOST_CFG/kwinoutputconfig.json"
+        elif [ -f "$HOME/.config/terminal-plasma/kwinoutputconfig.json" ] && [ ! -e "$KWIN_HOST_CFG/kwinoutputconfig.json" ]; then
+            ln -s "$HOME/.config/terminal-plasma/kwinoutputconfig.json" "$KWIN_HOST_CFG/kwinoutputconfig.json"
+        fi
+        if [ -d "$HOME/.config/kscreen" ]; then
+            ln -sfn "$HOME/.config/kscreen" "$KWIN_HOST_CFG/kscreen"
+        elif [ -d "$HOME/.config/terminal-plasma/kscreen" ] && [ ! -e "$KWIN_HOST_CFG/kscreen" ]; then
+            ln -s "$HOME/.config/terminal-plasma/kscreen" "$KWIN_HOST_CFG/kscreen"
+        fi
+        cat > "$KWIN_HOST_CFG/kwinrc" <<'KWINRC'
+[Compositing]
+AllowTearing=true
+Backend=OpenGL
+Enabled=true
+
+[MouseBindings]
+CommandAllKey=
+CommandWindow1=Activate, pass click
+CommandWindow2=Activate, pass click
+CommandWindow3=Activate, pass click
+
+[Plugins]
+fadeEnabled=false
+glideEnabled=false
+scaleEnabled=false
+slideEnabled=false
+squashEnabled=false
+
+[Windows]
+BorderlessMaximizedWindows=true
+ElectricBorderMaximize=false
+ElectricBorderTiling=false
+ElectricBorders=0
+FocusPolicy=ClickToFocus
+KWINRC
+
+        export XDG_CONFIG_HOME="$KWIN_HOST_CFG"
+        export XDG_DATA_HOME="$HOME/.local/share/ascii-de-host"
+        export XDG_STATE_HOME="$HOME/.local/state/ascii-de-host"
+        export XDG_CACHE_HOME="$HOME/.cache/ascii-de-host"
+        export ASCII_DE_IN_KWIN_SESSION=1
+
+        if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+            exec dbus-run-session kwin_wayland --drm --no-lockscreen --no-global-shortcuts --exit-with-session "$SELF_PATH"
+        fi
+        exec kwin_wayland --drm --no-lockscreen --no-global-shortcuts --exit-with-session "$SELF_PATH"
+    fi
+
+    # Fallback when kwin_wayland is absent: direct EGLFS KMS
+    export QT_QPA_PLATFORM="eglfs"
+    export QT_QPA_EGLFS_INTEGRATION="${QT_QPA_EGLFS_INTEGRATION:-eglfs_kms}"
+    export QT_QPA_EGLFS_ALWAYS_SET_MODE=1
+
+    if [ -n "$HW_GUARD_BIN" ] && [ -x "$HW_GUARD_BIN" ]; then
+        "$HW_GUARD_BIN" --audio-only || true
+    fi
+    if [ -n "$BACKEND_BIN" ] && [ -x "$BACKEND_BIN" ]; then
+        "$BACKEND_BIN" theme sync-apps >/dev/null 2>&1 || true
+    fi
+    if [ -n "$AUTOSTART_BIN" ] && [ -x "$AUTOSTART_BIN" ]; then
+        "$AUTOSTART_BIN" &
+    fi
+    ensure_scroll_bridge_async
+
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-run-session >/dev/null 2>&1; then
+        exec dbus-run-session "$COMPOSITOR_BIN" --fullscreen --all-monitors "${EXTRA_ARGS[@]}"
+    fi
+    exec "$COMPOSITOR_BIN" --fullscreen --all-monitors "${EXTRA_ARGS[@]}"
+else
+    # Nested window on current Wayland (or X11 fallback) desktop
+    export ASCII_DE_NESTED=1
+    export ASCII_DE_WIDTH="${ASCII_DE_WIDTH:-1600}"
+    export ASCII_DE_HEIGHT="${ASCII_DE_HEIGHT:-960}"
+    prepend_shim_paths
+
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        export QT_QPA_PLATFORM="wayland"
+    elif [ -n "${DISPLAY:-}" ]; then
+        export QT_QPA_PLATFORM="xcb"
+    else
+        export QT_QPA_PLATFORM="wayland"
+    fi
+
+    if [ -n "$BACKEND_BIN" ] && [ -x "$BACKEND_BIN" ]; then
+        "$BACKEND_BIN" theme sync-apps >/dev/null 2>&1 || true
+    fi
+
+    exec "$COMPOSITOR_BIN" "${EXTRA_ARGS[@]}"
+fi

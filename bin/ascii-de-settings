@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import threading
+
+
+def resolve_ui_dir() -> Path:
+    candidates = []
+    for env_key in ("ASCII_DE_UI_DIR", "ASCII_DE_QML_DIR"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            candidates.append(Path(val))
+    candidates.extend([
+        Path("/usr/share/ascii-de/ui"),
+        Path.home() / ".local" / "share" / "ascii-de" / "ui",
+        Path(__file__).resolve().parent.parent / "ui",
+        Path.home() / "Projecten" / "ascii-de" / "ui",
+    ])
+    for cand in candidates:
+        if (cand / "AsciiSettingsApp.qml").is_file():
+            return cand
+    return candidates[0]
+
+
+def resolve_backend_bin() -> Path:
+    env_bin = os.environ.get("ASCII_DE_BACKEND_BIN", "").strip()
+    if env_bin:
+        p = Path(env_bin)
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+    sibling = Path(__file__).resolve().parent / "ascii-de-backend"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return sibling
+    in_path = shutil.which("ascii-de-backend")
+    if in_path:
+        return Path(in_path)
+    return Path.home() / "bin" / "ascii-de-backend"
+
+
+UI_DIR = resolve_ui_dir()
+BACKEND_BIN = resolve_backend_bin()
+
+
+def _configure_wayland_env() -> None:
+    if os.environ.get("QT_QPA_PLATFORM"):
+        return
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    wayland = os.environ.get("WAYLAND_DISPLAY", "")
+    if not wayland:
+        for candidate in ("wayland-ascii-0", "wayland-0"):
+            if (runtime_dir / candidate).exists():
+                os.environ["WAYLAND_DISPLAY"] = candidate
+                wayland = candidate
+                break
+    if wayland:
+        os.environ.setdefault("QT_QPA_PLATFORM", "wayland")
+
+
+_configure_wayland_env()
+
+from PyQt6.QtCore import QObject, QUrl, pyqtSignal, pyqtSlot  # noqa: E402
+from PyQt6.QtQml import QQmlApplicationEngine  # noqa: E402
+
+try:
+    from PyQt6.QtWidgets import QApplication as _QtApp  # noqa: E402
+except ImportError:
+    from PyQt6.QtGui import QGuiApplication as _QtApp  # noqa: E402
+
+
+class BackendBridge(QObject):
+    backendResult = pyqtSignal(str, str, arguments=["tag", "jsonOutput"])
+
+    def _exec_backend(self, args: list[str]) -> str:
+        if not BACKEND_BIN.exists():
+            return json.dumps({"error": f"Missing backend binary: {BACKEND_BIN}"})
+        try:
+            proc = subprocess.run(
+                [str(BACKEND_BIN), *[str(a) for a in args]],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            out = (proc.stdout or "").strip()
+            if not out and proc.stderr:
+                return json.dumps({"error": proc.stderr.strip()})
+            return out or "{}"
+        except Exception as exc:
+            return json.dumps({"error": str(exc)})
+
+    @pyqtSlot("QStringList", result=str)
+    def runBackend(self, args: list[str]) -> str:
+        return self._exec_backend(list(args))
+
+    @pyqtSlot("QStringList", str)
+    def runBackendAsync(self, args: list[str], tag: str) -> None:
+        arg_list = [str(a) for a in args]
+
+        def _worker() -> None:
+            result = self._exec_backend(arg_list)
+            self.backendResult.emit(tag, result)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    @pyqtSlot(str)
+    def spawnApp(self, cmd: str) -> None:
+        cmd = (cmd or "").strip()
+        if not cmd:
+            return
+        try:
+            subprocess.Popen(
+                ["bash", "-lc", cmd],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
+
+
+HOST_QML = """import QtQuick
+import QtQuick.Window
+
+Window {
+    id: hostWindow
+    visible: true
+    color: sharedTheme.bg || "#0d0f10"
+    minimumWidth: 760
+    minimumHeight: 540
+    width: viewWidth(activeView)
+    height: viewHeight(activeView)
+    title: viewTitle(activeView)
+
+    property string initialView: "__INITIAL_VIEW__"
+    property string activeView: "__INITIAL_VIEW__"
+    property int initialTab: __INITIAL_TAB__
+
+    property var sharedTheme: ({
+        name: "mono",
+        bg: "#0b0b0b",
+        bgSecondary: "#151515",
+        panelBg: "#151515",
+        gridDot: "#2a2a2a",
+        snapLine: "#8b949e",
+        fg: "#e5e5e5",
+        accent: "#ffffff",
+        secondary: "#a3a3a3",
+        muted: "#666666",
+        danger: "#ff5555",
+        closeBtnBg: "#ff5555",
+        fontFamily: "JetBrains Mono",
+        fontSize: 13,
+        chromeStyle: "ascii",
+        backgroundStyle: "ascii_grid",
+        gridChar: "·",
+        cornerRadius: 0,
+        borderWidth: 1,
+        smearDrag: false,
+        impactFlash: false,
+        speedLines: false,
+        originSmear: false,
+        monitorBackgrounds: ({})
+    })
+    property var sharedSettings: ({})
+    property var sharedMonitors: []
+    property var sharedTelemetry: ({
+        audio_label: "PipeWire",
+        audio_vol: 100,
+        audio_muted: false,
+        onkyo_active: false,
+        onkyo_detected: false,
+        has_onkyo: false,
+        has_nvidia: false,
+        sinks: []
+    })
+
+    function safeJson(raw, fallback) {
+        try {
+            if (!raw || typeof raw !== "string") return fallback;
+            return JSON.parse(raw);
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    function viewWidth(v) {
+        if (v === "bg") return 1000;
+        if (v === "theme") return 940;
+        if (v === "displays") return 900;
+        return 960;
+    }
+
+    function viewHeight(v) {
+        if (v === "bg") return 660;
+        if (v === "theme") return 640;
+        if (v === "displays") return 600;
+        return 660;
+    }
+
+    function viewTitle(v) {
+        if (v === "bg") return "ASCII-DE Wallpaper & Tile Studio";
+        if (v === "theme") return "ASCII-DE Theme Studio";
+        if (v === "displays") return "ASCII-DE Display Layout";
+        return "ASCII-DE Settings";
+    }
+
+    function returnOrQuit() {
+        if (activeView === initialView) {
+            Qt.quit();
+        } else {
+            activeView = initialView;
+        }
+    }
+
+    function loadInitialState() {
+        var th = safeJson(Backend.runBackend(["theme", "get"]), null);
+        if (th && typeof th === "object" && th.bg) sharedTheme = th;
+
+        var cfg = safeJson(Backend.runBackend(["settings", "get"]), null);
+        if (cfg && typeof cfg === "object" && !cfg.error) sharedSettings = cfg;
+
+        var mons = safeJson(Backend.runBackend(["displays", "list"]), null);
+        if (Array.isArray(mons)) sharedMonitors = mons;
+
+        var st = safeJson(Backend.runBackend(["status"]), null);
+        if (st && typeof st === "object" && !st.error) sharedTelemetry = st;
+    }
+
+    Component.onCompleted: {
+        loadInitialState();
+        settingsView.activeTab = Math.max(0, Math.min(6, initialTab));
+    }
+
+    Timer {
+        interval: 3000
+        running: true
+        repeat: true
+        onTriggered: Backend.runBackendAsync(["status"], "host_status")
+    }
+
+    Connections {
+        target: Backend
+        function onBackendResult(tag, jsonOutput) {
+            if (tag === "host_status") {
+                var st = hostWindow.safeJson(jsonOutput, null);
+                if (st && typeof st === "object" && !st.error) {
+                    hostWindow.sharedTelemetry = st;
+                }
+            }
+        }
+    }
+
+    AsciiSettingsApp {
+        id: settingsView
+        anchors.fill: parent
+        visible: hostWindow.activeView === "settings"
+        theme: hostWindow.sharedTheme
+        monoFamily: String((hostWindow.sharedTheme && hostWindow.sharedTheme.fontFamily) || "JetBrains Mono")
+        telemetry: hostWindow.sharedTelemetry
+        settings: hostWindow.sharedSettings
+        monitors: hostWindow.sharedMonitors
+        onCloseRequested: Qt.quit()
+        onSettingsUpdated: (cfg) => { hostWindow.sharedSettings = cfg; }
+        onThemeUpdated: (th) => { hostWindow.sharedTheme = th; }
+        onOpenDisplayEditorRequested: hostWindow.activeView = "displays"
+        onOpenBackgroundEditorRequested: hostWindow.activeView = "bg"
+        onOpenThemeAppRequested: hostWindow.activeView = "theme"
+        onRequestSpawnApp: (cmd) => Backend.spawnApp(cmd)
+        onRefreshStatusRequested: Backend.runBackendAsync(["status"], "host_status")
+    }
+
+    AsciiBackgroundEditor {
+        id: bgView
+        anchors.fill: parent
+        visible: hostWindow.activeView === "bg"
+        theme: hostWindow.sharedTheme
+        monoFamily: String((hostWindow.sharedTheme && hostWindow.sharedTheme.fontFamily) || "JetBrains Mono")
+        availableMonitors: hostWindow.sharedMonitors
+        settings: hostWindow.sharedSettings
+        onCloseRequested: hostWindow.returnOrQuit()
+        onSettingsUpdated: (cfg) => { hostWindow.sharedSettings = cfg; }
+        onThemeUpdated: (th) => { hostWindow.sharedTheme = th; }
+    }
+
+    AsciiThemeApp {
+        id: themeView
+        anchors.fill: parent
+        visible: hostWindow.activeView === "theme"
+        theme: hostWindow.sharedTheme
+        monoFamily: String((hostWindow.sharedTheme && hostWindow.sharedTheme.fontFamily) || "JetBrains Mono")
+        availableMonitors: hostWindow.sharedMonitors
+        onCloseRequested: hostWindow.returnOrQuit()
+        onOpenBackgroundEditorRequested: hostWindow.activeView = "bg"
+        onThemeUpdated: (th) => { hostWindow.sharedTheme = th; }
+    }
+
+    AsciiDisplayEditor {
+        id: displaysView
+        anchors.fill: parent
+        visible: hostWindow.activeView === "displays"
+        theme: hostWindow.sharedTheme
+        monoFamily: String((hostWindow.sharedTheme && hostWindow.sharedTheme.fontFamily) || "JetBrains Mono")
+        monitors: hostWindow.sharedMonitors
+        onCloseRequested: hostWindow.returnOrQuit()
+        onDisplaysUpdated: (mons) => { hostWindow.sharedMonitors = mons; }
+    }
+}
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Standalone ASCII-DE Settings & Studio Runner")
+    parser.add_argument(
+        "--view",
+        choices=("settings", "bg", "theme", "displays"),
+        default="settings",
+        help="Initial view to open",
+    )
+    parser.add_argument(
+        "--tab",
+        type=int,
+        default=0,
+        help="Initial settings tab (0..6)",
+    )
+    args = parser.parse_args()
+
+    app = _QtApp(sys.argv)
+    app.setApplicationName("ascii-de-settings")
+    app.setDesktopFileName("ascii-de-settings")
+
+    engine = QQmlApplicationEngine()
+    engine.addImportPath(str(UI_DIR))
+
+    bridge = BackendBridge()
+    engine.rootContext().setContextProperty("Backend", bridge)
+
+    qml_src = (
+        HOST_QML.replace("__INITIAL_VIEW__", args.view)
+        .replace("__INITIAL_TAB__", str(max(0, min(6, args.tab))))
+    )
+    engine.loadData(qml_src.encode("utf-8"), QUrl.fromLocalFile(str(UI_DIR / "StandaloneSettingsHost.qml")))
+    if not engine.rootObjects():
+        sys.stderr.write("Failed to load ASCII-DE Settings QML.\n")
+        return 1
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

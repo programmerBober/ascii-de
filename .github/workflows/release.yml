@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Initialize keyring and install build/runtime dependencies
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm --needed \
+            git cmake ninja rust gcc namcap tar zstd \
+            qt6-base qt6-declarative qt6-wayland wayland kwin libkscreen \
+            xwayland-satellite xorg-xwayland wl-clipboard pam dbus chafa \
+            libpulse wireplumber kitty ttf-jetbrains-mono breeze-icons \
+            playerctl brightnessctl bluez-utils rofi bluetui \
+            python python-pyqt6 python-evdev python-xlib jq curl
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify VERSION matches tag and run tests
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          FILE_VER="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$TAG_VER" != "$FILE_VER" ]]; then
+            echo "ERROR: Tag ($TAG_VER) does not match VERSION ($FILE_VER)" >&2
+            exit 1
+          fi
+          if [[ -x /usr/lib/qt6/bin/qmllint ]]; then
+            QMLLINT="/usr/lib/qt6/bin/qmllint"
+          else
+            QMLLINT="$(command -v qmllint6 || command -v qmllint-qt6 || command -v qmllint)"
+          fi
+          "$QMLLINT" -I ui ui/*.qml
+          cargo test --manifest-path backend/Cargo.toml --locked
+
+      - name: Build Arch package (.pkg.tar.zst)
+        run: |
+          VER="$(tr -d '[:space:]' < VERSION)"
+          STAGE="$(mktemp -d)"
+          mkdir -p dist "$STAGE/ascii-de-${VER}"
+          tar --exclude='./.git' --exclude='./compositor/build' --exclude='./backend/target' -cf - . | tar -C "$STAGE/ascii-de-${VER}" -xf -
+          tar -C "$STAGE" -czf "packaging/arch/ascii-de-${VER}.tar.gz" "ascii-de-${VER}"
+          rm -rf "$STAGE"
+          useradd -m builder
+          chown -R builder:builder .
+          su - builder -c "cd '$PWD/packaging/arch' && makepkg --noconfirm"
+          cp packaging/arch/*.pkg.tar.zst dist/
+          namcap packaging/arch/*.pkg.tar.zst
+
+      - name: Build portable tarball (.tar.zst) and SHA256SUMS
+        run: |
+          VER="$(tr -d '[:space:]' < VERSION)"
+          STAGE="dist/ascii-de-${VER}-linux-x86_64"
+          mkdir -p "$STAGE"
+          tar --zstd -xf dist/ascii-de-${VER}-*-x86_64.pkg.tar.zst -C "$STAGE" usr/
+          mv "$STAGE/usr/"* "$STAGE/"
+          rmdir "$STAGE/usr"
+          tar --zstd -cf "dist/ascii-de-${VER}-linux-x86_64.tar.zst" -C dist "ascii-de-${VER}-linux-x86_64"
+          rm -rf "$STAGE"
+          (cd dist && sha256sum *.pkg.tar.zst *.tar.zst > SHA256SUMS)
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.pkg.tar.zst
+            dist/*.tar.zst
+            dist/SHA256SUMS
+          generate_release_notes: true

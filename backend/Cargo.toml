@@ -1,0 +1,10 @@
+[package]
+name = "ascii-de-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-std system, app, desktop icon, theme, and PipeWire audio backend for ASCII-DE"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
