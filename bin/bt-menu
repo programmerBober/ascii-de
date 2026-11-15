@@ -46,13 +46,46 @@ def detect_x11_display():
     return ":14"
 
 
+def log_bt(msg):
+    try:
+        cache_dir = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ascii-de"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with open(cache_dir / "bt-menu.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def open_terminal(cmd_args):
+    candidates = []
+    sibling = Path(__file__).resolve().parent / "ascii-de-terminal"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        candidates.append(str(sibling))
+    for name in ("ascii-de-terminal", "kitty", "alacritty", "foot", "konsole", "xterm"):
+        found = shutil.which(name)
+        if found and found not in candidates:
+            candidates.append(found)
+    for term in candidates:
+        try:
+            subprocess.Popen([term, "-e", *cmd_args], start_new_session=True)
+            return True
+        except Exception as exc:
+            log_bt(f"terminal launch failed ({term}): {exc}")
+    notify("Bluetooth", "No terminal emulator found to launch bluetui.", "critical")
+    return False
+
+
 def run_cmd(cmd, check=False, timeout=10):
     try:
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
         if check and res.returncode != 0:
             return ""
-        return res.stdout.strip()
-    except Exception:
+        combined = (res.stdout or "").strip()
+        if not combined and res.stderr:
+            combined = res.stderr.strip()
+        return combined
+    except Exception as exc:
+        log_bt(f"run_cmd {cmd}: {exc}")
         return ""
 
 
@@ -61,11 +94,14 @@ def notify(title, msg, urgency="normal"):
 
 
 def get_controller_status():
-    out = run_cmd(["bluetoothctl", "show"])
+    out = run_cmd(["bluetoothctl", "show"], timeout=4)
+    if not out or "No default controller available" in out:
+        svc = run_cmd(["systemctl", "is-active", "bluetooth"], timeout=3)
+        return False, f"No controller ({svc or 'unknown'})", False
     powered = "Powered: yes" in out
     name_match = re.search(r"Name:\s+(.*)", out)
     name = name_match.group(1).strip() if name_match else "Bluetooth"
-    return powered, name
+    return powered, name, True
 
 
 def get_devices():
@@ -109,7 +145,10 @@ def get_devices():
 
 
 def toggle_power():
-    powered, _ = get_controller_status()
+    powered, _, has_ctl = get_controller_status()
+    if not has_ctl:
+        notify("Bluetooth", "No Bluetooth adapter found or bluetooth.service is inactive.", "critical")
+        return
     new_state = "off" if powered else "on"
     run_cmd(["bluetoothctl", "power", new_state])
     notify("Bluetooth", f"Power turned {new_state.upper()}")
@@ -189,12 +228,15 @@ def show_menu(prompt, items):
         if os.path.exists(theme_path):
             rofi_cmd.extend(["-theme", theme_path])
         try:
-            res = subprocess.run(rofi_cmd, input="\n".join(items), stdout=subprocess.PIPE, text=True, env=env)
+            res = subprocess.run(rofi_cmd, input="\n".join(items), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
             if res.returncode == 0:
                 return res.stdout.strip()
-            return None
-        except Exception:
-            pass
+            if res.returncode not in (0, 1):
+                log_bt(f"rofi failed (rc={res.returncode}, DISPLAY={env.get('DISPLAY', '')}): {res.stderr.strip()}")
+            else:
+                return None
+        except Exception as exc:
+            log_bt(f"rofi exception: {exc}")
 
     if shutil.which("fzf") and is_tty:
         try:
@@ -236,33 +278,50 @@ def main():
         if sys.stdin.isatty():
             os.execvp("bluetui", ["bluetui"])
         else:
-            subprocess.Popen(["kitty", "-e", "bluetui"])
+            open_terminal(["bluetui"])
             return
 
-    powered, ctl_name = get_controller_status()
-    devices = get_devices()
+    powered, ctl_name, has_ctl = get_controller_status()
+    devices = get_devices() if has_ctl else []
 
     menu_items = []
-    p_stat = "ON" if powered else "OFF"
-    menu_items.append(f"[●] Bluetooth: {p_stat} ({ctl_name}) -> Toggle")
-
-    if powered:
-        for d in devices:
-            if d["connected"]:
-                bat = f" [{d['battery']}]" if d["battery"] else ""
-                menu_items.append(f"[✓] {d['name']}{bat} (Connected)")
-            else:
-                menu_items.append(f"[ ] {d['name']} (Disconnected)")
-
-        menu_items.append("[+] Scan & Pair New Device...")
-        menu_items.append("[🎧] Switch Audio Sink to Bluetooth")
-        menu_items.append("[🖥️] Open Full Blueman GUI")
+    if not has_ctl:
+        menu_items.append(f"[!] Bluetooth Unavailable ({ctl_name})")
+        menu_items.append("[⚙] Start bluetooth.service (pkexec)")
         menu_items.append("[⌨️] Open Bluetui Terminal")
     else:
-        menu_items.append("[●] Turn Bluetooth ON")
+        p_stat = "ON" if powered else "OFF"
+        menu_items.append(f"[●] Bluetooth: {p_stat} ({ctl_name}) -> Toggle")
+
+        if powered:
+            for d in devices:
+                if d["connected"]:
+                    bat = f" [{d['battery']}]" if d["battery"] else ""
+                    menu_items.append(f"[✓] {d['name']}{bat} (Connected)")
+                else:
+                    menu_items.append(f"[ ] {d['name']} (Disconnected)")
+
+            menu_items.append("[+] Scan & Pair New Device...")
+            menu_items.append("[🎧] Switch Audio Sink to Bluetooth")
+            if shutil.which("blueman-manager"):
+                menu_items.append("[🖥️] Open Full Blueman GUI")
+        else:
+            menu_items.append("[●] Turn Bluetooth ON")
+        menu_items.append("[⌨️] Open Bluetui Terminal")
 
     sel = show_menu("Bluetooth", menu_items)
     if not sel:
+        return
+
+    if "Bluetooth Unavailable" in sel:
+        notify("Bluetooth", "No Bluetooth adapter found or bluetooth.service disabled.", "normal")
+        return
+
+    if "Start bluetooth.service" in sel:
+        if shutil.which("pkexec"):
+            subprocess.Popen(["pkexec", "systemctl", "enable", "--now", "bluetooth"], start_new_session=True)
+        else:
+            open_terminal(["sh", "-lc", "sudo systemctl enable --now bluetooth; printf '\nPress Enter...'; read -r _"])
         return
 
     if "Bluetooth: " in sel or "Turn Bluetooth ON" in sel:
@@ -274,8 +333,11 @@ def main():
         return
 
     if "Switch Audio Sink" in sel:
-        run_cmd([resolve_backend(), "audio", "bt"])
-        notify("Audio", "Switched audio sink to Bluetooth headset.")
+        out = run_cmd([resolve_backend(), "audio", "bt"])
+        if '"error"' in out:
+            notify("Audio", "No Bluetooth audio sink found.", "critical")
+        else:
+            notify("Audio", "Switched audio sink to Bluetooth headset.")
         return
 
     if "Open Full Blueman GUI" in sel:
@@ -283,7 +345,7 @@ def main():
         return
 
     if "Open Bluetui Terminal" in sel:
-        subprocess.Popen(["kitty", "-e", "bluetui"])
+        open_terminal(["bluetui"])
         return
 
     for d in devices:

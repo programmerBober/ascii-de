@@ -515,7 +515,7 @@ Item {
     }
 
     function openAudioMixer() {
-        root.requestSpawnApp("kitty -e sh -lc 'for c in terminal-plasma-mixer wiremix pulsemixer alsamixer; do command -v \"$c\" >/dev/null 2>&1 && exec \"$c\"; done; wpctl status; printf \"\\nPress Enter...\"; read -r _'");
+        root.requestSpawnApp("sh -lc 'T=\"$(command -v ascii-de-terminal || command -v kitty || command -v foot || command -v konsole)\"; exec \"$T\" -e sh -lc '\''for c in terminal-plasma-mixer wiremix pulsemixer alsamixer; do command -v \"$c\" >/dev/null 2>&1 && exec \"$c\"; done; wpctl status; printf \"\\nPress Enter...\"; read -r _'\'''");
     }
 
     function openSettings() {

@@ -1730,7 +1730,7 @@ WaylandCompositor {
                         enabled: waylandOut.isPrimary && !wmState.screenLocked
                         sequence: "Meta+Return"
                         context: Qt.ApplicationShortcut
-                        onActivated: Backend.launchApp("kitty")
+                        onActivated: Backend.launchApp("ascii-de-terminal")
                     }
                     Shortcut {
                         enabled: waylandOut.isPrimary && !wmState.screenLocked

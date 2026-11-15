@@ -1,5 +1,6 @@
 mod audio;
 mod bg_ascii;
+mod bugreport;
 mod displays;
 mod hardware;
 mod icons;
@@ -28,7 +29,8 @@ fn print_usage() {
          \x20 bg-ascii convert <json>\n\
          \x20 version [--json]\n\
          \x20 migrate\n\
-         \x20 update-check"
+         \x20 update-check\n\
+         \x20 bug-report [--note <text>] [--upload]"
     );
 }
 
@@ -52,6 +54,7 @@ fn main() -> ExitCode {
         "version" | "--version" | "-V" => Ok(maintain::handle_version_cmd(&args[1..])),
         "migrate" => maintain::handle_migrate_cmd(),
         "update-check" => Ok(maintain::handle_update_check_cmd()),
+        "bug-report" => bugreport::handle_bug_report_cmd(&args[1..]),
         "-h" | "--help" | "help" => {
             print_usage();
             return ExitCode::SUCCESS;

@@ -38,6 +38,17 @@ Rectangle {
         checkedAt: ""
     })
     property bool checkingUpdates: false
+    property bool bugReportLoading: false
+    property bool bugReportOpenIssueAfter: false
+    property var bugReportInfo: ({
+        path: "",
+        pasteUrl: "",
+        issueUrl: "",
+        uploadError: "",
+        copied: false,
+        bytes: 0,
+        preview: ""
+    })
     readonly property bool hasOnkyo: {
         if (Boolean(root.telemetry.has_onkyo || root.telemetry.onkyo_detected || root.telemetry.onkyo_active)) {
             return true;
@@ -408,6 +419,14 @@ Rectangle {
         }
     }
 
+    function shellQuote(s) {
+        return "'" + String(s || "").replace(/'/g, "'\"'\"'") + "'";
+    }
+
+    function terminalCmd(shellBody) {
+        return "sh -lc 'T=\"$(command -v ascii-de-terminal || command -v kitty || command -v foot || command -v konsole || command -v xterm)\"; exec \"$T\" -e sh -lc " + shellQuote(shellBody) + "'";
+    }
+
     function loadSettings() {
         statusError = false;
         statusMessage = "Loading settings...";
@@ -677,7 +696,40 @@ Rectangle {
                     root.monitors = mons;
                 }
             } else if (tag === "settings_audio") {
+                var ares = root.safeJsonParse(jsonOutput, null);
+                if (ares && ares.error) {
+                    root.statusError = true;
+                    root.statusMessage = String(ares.error);
+                } else {
+                    root.statusError = false;
+                }
                 root.refreshStatusRequested();
+            } else if (tag === "settings_bug_report" || tag === "settings_bug_report_upload") {
+                root.bugReportLoading = false;
+                var openAfter = root.bugReportOpenIssueAfter;
+                root.bugReportOpenIssueAfter = false;
+                var br = root.safeJsonParse(jsonOutput, null);
+                if (br && typeof br === "object" && br.ok) {
+                    root.bugReportInfo = br;
+                    if (br.uploadError && String(br.uploadError).length > 0) {
+                        root.statusError = true;
+                        root.statusMessage = "Saved " + (br.path || "report") + " (upload failed: " + br.uploadError + ")";
+                    } else if (br.pasteUrl && String(br.pasteUrl).length > 0) {
+                        root.statusError = false;
+                        root.statusMessage = "Uploaded & copied URL: " + br.pasteUrl;
+                    } else {
+                        root.statusError = false;
+                        root.statusMessage = br.copied
+                            ? ("Report copied to clipboard (" + (br.path || "") + ")")
+                            : ("Report saved: " + (br.path || ""));
+                    }
+                    if (openAfter && br.issueUrl) {
+                        root.requestSpawnApp("xdg-open " + root.shellQuote(String(br.issueUrl)));
+                    }
+                } else {
+                    root.statusError = true;
+                    root.statusMessage = (br && br.error) ? String(br.error) : "Failed to collect bug report.";
+                }
             } else if (tag === "settings_update_check") {
                 root.checkingUpdates = false;
                 var upd = root.safeJsonParse(jsonOutput, null);
@@ -826,7 +878,7 @@ Rectangle {
                             { idx: 3, label: root.hasOnkyo ? "[ 4. Audio & Onkyo     ]" : "[ 4. Audio & Devices   ]" },
                             { idx: 4, label: "[ 5. Windows & Snap    ]" },
                             { idx: 5, label: "[ 6. Panel & Shortcuts ]" },
-                            { idx: 6, label: (root.updateInfo && root.updateInfo.updateAvailable) ? "[ 7. Updates [UPD]     ]" : "[ 7. Updates           ]" }
+                            { idx: 6, label: (root.updateInfo && root.updateInfo.updateAvailable) ? "[ 7. Updates & Bugs [U]]" : "[ 7. Updates & Bugs    ]" }
                         ]
                         delegate: Rectangle {
                             id: tabDel
@@ -1830,7 +1882,7 @@ Rectangle {
                                     Layout.fillWidth: true; height: 28
                                     color: sBtMa.containsMouse ? root.theme.accent : root.theme.panelBg
                                     border.color: root.theme.accent; border.width: 1
-                                    Text { anchors.centerIn: parent; font.family: root.monoFamily; font.pixelSize: 11; font.bold: true; color: sBtMa.containsMouse ? root.theme.bg : root.theme.accent; text: "[ Bluetooth ]" }
+                                    Text { anchors.centerIn: parent; font.family: root.monoFamily; font.pixelSize: 11; font.bold: true; color: sBtMa.containsMouse ? root.theme.bg : root.theme.accent; text: "[ BT Audio Sink ]" }
                                     MouseArea { id: sBtMa; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: root.runBackend(["audio", "bt"], "settings_audio") }
                                 }
 
@@ -1838,16 +1890,13 @@ Rectangle {
                                     Layout.fillWidth: true; height: 28
                                     color: sBtMenuMa.containsMouse ? root.theme.accent : root.theme.panelBg
                                     border.color: root.theme.accent; border.width: 1
-                                    Text { anchors.centerIn: parent; font.family: root.monoFamily; font.pixelSize: 11; font.bold: true; color: sBtMenuMa.containsMouse ? root.theme.bg : root.theme.accent; text: "[ BT Menu ]" }
+                                    Text { anchors.centerIn: parent; font.family: root.monoFamily; font.pixelSize: 11; font.bold: true; color: sBtMenuMa.containsMouse ? root.theme.bg : root.theme.accent; text: "[ Bluetooth Manager ]" }
                                     MouseArea {
                                         id: sBtMenuMa
                                         anchors.fill: parent
                                         hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            var b = root.getBackend();
-                                            if (b && b.launchApp) b.launchApp("bt-menu");
-                                        }
+                                        onClicked: root.requestSpawnApp("bt-menu")
                                     }
                                 }
                             }
@@ -1880,7 +1929,7 @@ Rectangle {
                                     cursorShape: Qt.PointingHandCursor
                                     onClicked: {
                                         root.closeRequested();
-                                        root.requestSpawnApp("kitty -e sh -lc 'for c in terminal-plasma-mixer wiremix pulsemixer alsamixer; do command -v \"$c\" >/dev/null 2>&1 && exec \"$c\"; done; wpctl status; printf \"\\nPress Enter...\"; read -r _'");
+                                        root.requestSpawnApp(root.terminalCmd("for c in terminal-plasma-mixer wiremix pulsemixer alsamixer; do command -v \"$c\" >/dev/null 2>&1 && exec \"$c\"; done; wpctl status; printf \"\\nPress Enter...\"; read -r _"));
                                     }
                                 }
                             }
@@ -2083,7 +2132,7 @@ Rectangle {
                                 font.pixelSize: 11
                                 color: root.theme.fg
                                 text: "  Meta / Super       : Toggle Start Menu\n"
-                                      + "  Meta + Enter       : Launch Terminal (kitty)\n"
+                                      + "  Meta + Enter       : Launch Terminal (ascii-de-terminal)\n"
                                       + "  Meta + S           : System Settings\n"
                                       + "  Meta + P / Meta+D  : Display Layout Editor\n"
                                       + "  Meta + I           : Desktop Icon Manager\n"
@@ -2221,13 +2270,193 @@ Rectangle {
                                         anchors.fill: parent
                                         hoverEnabled: true
                                         cursorShape: Qt.PointingHandCursor
-                                        onClicked: {
-                                            root.closeRequested();
-                                            root.requestSpawnApp("kitty -e sh -lc 'if command -v ascii-de >/dev/null 2>&1 && (command -v ascii-de-update >/dev/null 2>&1 || [ -x /usr/bin/ascii-de-update ]); then ascii-de update --apply; elif command -v ascii-de-update >/dev/null 2>&1; then ascii-de-update --apply; else echo \"ascii-de-update is not installed on PATH.\"; fi; printf \"\\nPress Enter to close...\"; read -r _'");
-                                        }
+                                    onClicked: {
+                                        root.closeRequested();
+                                        root.requestSpawnApp(root.terminalCmd("if command -v ascii-de >/dev/null 2>&1 && (command -v ascii-de-update >/dev/null 2>&1 || [ -x /usr/bin/ascii-de-update ]); then ascii-de update --apply; elif command -v ascii-de-update >/dev/null 2>&1; then ascii-de-update --apply; else echo \"ascii-de-update is not installed on PATH.\"; fi; printf \"\\nPress Enter to close...\"; read -r _"));
                                     }
                                 }
                             }
+                        }
+
+                        Text {
+                            font.family: root.monoFamily
+                            font.pixelSize: 12
+                            font.bold: true
+                            color: root.theme.accent
+                            text: "═══ BUG REPORT & LOGS ═══"
+                        }
+
+                        Rectangle {
+                            Layout.fillWidth: true
+                            implicitHeight: bugCol.implicitHeight + 16
+                            color: root.theme.panelBg
+                            border.color: root.theme.muted
+                            border.width: 1
+
+                            ColumnLayout {
+                                id: bugCol
+                                anchors { fill: parent; margins: 8 }
+                                spacing: 6
+
+                                Text {
+                                    Layout.fillWidth: true
+                                    wrapMode: Text.WordWrap
+                                    font.family: root.monoFamily
+                                    font.pixelSize: 10
+                                    color: root.theme.secondary
+                                    text: "Collects sanitized system, audio, bluetooth, display & session logs to share safely."
+                                }
+
+                                Rectangle {
+                                    Layout.fillWidth: true
+                                    height: 28
+                                    color: root.theme.bg
+                                    border.color: bugNoteInput.activeFocus ? root.theme.accent : root.theme.muted
+                                    border.width: 1
+
+                                    TextInput {
+                                        id: bugNoteInput
+                                        anchors { fill: parent; margins: 6 }
+                                        verticalAlignment: TextInput.AlignVCenter
+                                        clip: true
+                                        font.family: root.monoFamily
+                                        font.pixelSize: 11
+                                        color: root.theme.fg
+                                        selectionColor: root.theme.accent
+                                        selectedTextColor: root.theme.bg
+                                    }
+
+                                    Text {
+                                        anchors { fill: parent; margins: 6 }
+                                        verticalAlignment: Text.AlignVCenter
+                                        font.family: root.monoFamily
+                                        font.pixelSize: 11
+                                        color: root.theme.muted
+                                        visible: bugNoteInput.text.length === 0 && !bugNoteInput.activeFocus
+                                        text: "Describe issue (optional)..."
+                                    }
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        height: 28
+                                        color: collectBugMa.containsMouse ? root.theme.accent : root.theme.bg
+                                        border.color: root.theme.accent
+                                        border.width: 1
+                                        Text {
+                                            anchors.centerIn: parent
+                                            font.family: root.monoFamily
+                                            font.pixelSize: 10
+                                            font.bold: true
+                                            color: collectBugMa.containsMouse ? root.theme.bg : root.theme.accent
+                                            text: root.bugReportLoading ? "[ Working... ]" : "[ Collect & Copy Logs ]"
+                                        }
+                                        MouseArea {
+                                            id: collectBugMa
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                if (root.bugReportLoading) return;
+                                                root.bugReportLoading = true;
+                                                root.bugReportOpenIssueAfter = false;
+                                                root.statusError = false;
+                                                root.statusMessage = "Collecting sanitized diagnostics...";
+                                                root.runBackend(["bug-report", "--note", bugNoteInput.text], "settings_bug_report");
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        height: 28
+                                        color: uploadBugMa.containsMouse ? root.theme.secondary : root.theme.bg
+                                        border.color: root.theme.secondary
+                                        border.width: 1
+                                        Text {
+                                            anchors.centerIn: parent
+                                            font.family: root.monoFamily
+                                            font.pixelSize: 10
+                                            font.bold: true
+                                            color: uploadBugMa.containsMouse ? root.theme.bg : root.theme.secondary
+                                            text: "[ Upload Logs (paste.rs) ]"
+                                        }
+                                        MouseArea {
+                                            id: uploadBugMa
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                if (root.bugReportLoading) return;
+                                                root.bugReportLoading = true;
+                                                root.bugReportOpenIssueAfter = false;
+                                                root.statusError = false;
+                                                root.statusMessage = "Collecting & uploading sanitized logs...";
+                                                root.runBackend(["bug-report", "--upload", "--note", bugNoteInput.text], "settings_bug_report_upload");
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        height: 28
+                                        color: issueBugMa.containsMouse ? root.theme.accent : root.theme.bg
+                                        border.color: root.theme.accent
+                                        border.width: 1
+                                        Text {
+                                            anchors.centerIn: parent
+                                            font.family: root.monoFamily
+                                            font.pixelSize: 10
+                                            font.bold: true
+                                            color: issueBugMa.containsMouse ? root.theme.bg : root.theme.accent
+                                            text: "[ Open GitHub Issue ]"
+                                        }
+                                        MouseArea {
+                                            id: issueBugMa
+                                            anchors.fill: parent
+                                            hoverEnabled: true
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: {
+                                                if (root.bugReportInfo && root.bugReportInfo.issueUrl) {
+                                                    root.requestSpawnApp("xdg-open " + root.shellQuote(String(root.bugReportInfo.issueUrl)));
+                                                    return;
+                                                }
+                                                if (root.bugReportLoading) return;
+                                                root.bugReportLoading = true;
+                                                root.bugReportOpenIssueAfter = true;
+                                                root.statusError = false;
+                                                root.statusMessage = "Preparing diagnostics for GitHub Issue...";
+                                                root.runBackend(["bug-report", "--note", bugNoteInput.text], "settings_bug_report");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Text {
+                                    visible: Boolean(root.bugReportInfo && root.bugReportInfo.path)
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideMiddle
+                                    font.family: root.monoFamily
+                                    font.pixelSize: 10
+                                    color: root.theme.fg
+                                    text: "SAVED FILE : " + ((root.bugReportInfo && root.bugReportInfo.path) ? root.bugReportInfo.path : "")
+                                }
+
+                                Text {
+                                    visible: Boolean(root.bugReportInfo && root.bugReportInfo.pasteUrl)
+                                    Layout.fillWidth: true
+                                    elide: Text.ElideRight
+                                    font.family: root.monoFamily
+                                    font.pixelSize: 10
+                                    color: root.theme.secondary
+                                    text: "PASTE URL  : " + ((root.bugReportInfo && root.bugReportInfo.pasteUrl) ? root.bugReportInfo.pasteUrl : "")
+                                }
+                            }
+                        }
                         }
                     }
                 }

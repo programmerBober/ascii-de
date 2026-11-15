@@ -25,7 +25,7 @@ pub fn handle_version_cmd(args: &[String]) -> String {
     }
 }
 
-fn utc_timestamp_compact() -> String {
+pub fn utc_timestamp_compact() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
