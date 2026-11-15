@@ -2,7 +2,10 @@
 set -euo pipefail
 
 REPO="${ASCII_DE_REPO:-programmerBober/ascii-de}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR=""
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
 
 MODE="release"
 YES_MODE=0
@@ -37,7 +40,15 @@ while [[ "$#" -gt 0 ]]; do
     esac
 done
 
+require_repo_dir() {
+    if [[ -z "$SCRIPT_DIR" || ! -f "$SCRIPT_DIR/packaging/arch/PKGBUILD" ]]; then
+        echo "install.sh: --${MODE} must be run from inside an ascii-de git checkout." >&2
+        exit 1
+    fi
+}
+
 install_dev_mode() {
+    require_repo_dir
     echo "Configuring ASCII-DE developer mode in ${SCRIPT_DIR} (preserving ~/bin & ~/.config/ascii-de)..."
     export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -78,6 +89,7 @@ EOF
 }
 
 install_local_makepkg() {
+    require_repo_dir
     if ! command -v makepkg >/dev/null 2>&1; then
         echo "install.sh: makepkg not found (EndeavourOS/Arch required for --local)." >&2
         exit 1
@@ -133,7 +145,7 @@ install_github_release() {
         echo "install.sh: pacman not found (EndeavourOS/Arch required for --release)." >&2
         exit 1
     fi
-    for tool in curl jq sha256sum; do
+    for tool in curl sha256sum; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             echo "install.sh: missing required tool '$tool'. Install it first (pacman -S $tool)." >&2
             exit 1
@@ -144,10 +156,25 @@ install_github_release() {
     api_resp="$(curl -fsSL --max-time 15 -H "Accept: application/vnd.github+json" \
         "https://api.github.com/repos/${REPO}/releases/latest")"
 
-    local pkg_url pkg_name sum_url
-    pkg_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$")) | .browser_download_url' | head -n 1)"
-    pkg_name="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$")) | .name' | head -n 1)"
-    sum_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name == "SHA256SUMS") | .browser_download_url' | head -n 1)"
+    local pkg_url="" pkg_name="" sum_url=""
+    if command -v jq >/dev/null 2>&1; then
+        pkg_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select((.name | test("^ascii-de-debug-") | not) and (.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$"))) | .browser_download_url' | head -n 1)"
+        pkg_name="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select((.name | test("^ascii-de-debug-") | not) and (.name | test("^ascii-de-.*-x86_64\\.pkg\\.tar\\.zst$"))) | .name' | head -n 1)"
+        sum_url="$(printf '%s' "$api_resp" | jq -r '.assets[]? | select(.name == "SHA256SUMS") | .browser_download_url' | head -n 1)"
+    elif command -v python3 >/dev/null 2>&1; then
+        IFS=$'\t' read -r pkg_name pkg_url sum_url < <(
+            printf '%s' "$api_resp" | python3 -c '
+import json, re, sys
+assets = json.load(sys.stdin).get("assets", [])
+pkg = next((a for a in assets if not a["name"].startswith("ascii-de-debug-") and re.match(r"^ascii-de-.*-x86_64\.pkg\.tar\.zst$", a["name"])), {})
+sums = next((a for a in assets if a["name"] == "SHA256SUMS"), {})
+print("\t".join((pkg.get("name", ""), pkg.get("browser_download_url", ""), sums.get("browser_download_url", ""))))
+'
+        )
+    else
+        echo "install.sh: missing 'jq' or 'python3' to parse GitHub release metadata." >&2
+        exit 1
+    fi
 
     if [[ -z "$pkg_url" || -z "$sum_url" ]]; then
         echo "install.sh: latest release on ${REPO} lacks .pkg.tar.zst or SHA256SUMS." >&2
@@ -166,10 +193,19 @@ install_github_release() {
 
     local pac_flags=(-U --needed)
     [[ "$YES_MODE" -eq 1 ]] && pac_flags+=(--noconfirm)
-    if [[ "$EUID" -eq 0 ]]; then
-        pacman "${pac_flags[@]}" "$tmp_dir/$pkg_name"
+
+    run_pacman() {
+        if [[ "$EUID" -eq 0 ]]; then
+            pacman "$@"
+        else
+            sudo pacman "$@"
+        fi
+    }
+
+    if [[ ! -t 0 && -r /dev/tty && -w /dev/tty ]]; then
+        run_pacman "${pac_flags[@]}" "$tmp_dir/$pkg_name" < /dev/tty
     else
-        sudo pacman "${pac_flags[@]}" "$tmp_dir/$pkg_name"
+        run_pacman "${pac_flags[@]}" "$tmp_dir/$pkg_name"
     fi
 
     echo "OK: ASCII-DE installed from GitHub Release (${pkg_name})."
